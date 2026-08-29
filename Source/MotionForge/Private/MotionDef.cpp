@@ -1,6 +1,7 @@
 #include "MotionDef.h"
 
 #include "MotionForge.h"
+#include "MotionForgeSettings.h"
 
 const FMotionCandidate* UMotionDef::FindSelectedCandidate() const
 {
@@ -99,6 +100,32 @@ void UMotionDef::ApplySpec(const FMotionDefSpec& Spec)
 	if (!Spec.CharacterAssetPath.IsEmpty())
 	{
 		Character = TSoftObjectPtr<UMotionCharacter>(FSoftObjectPath(Spec.CharacterAssetPath));
+	}
+}
+
+void UMotionDef::ApplyProjectDefaults()
+{
+	const UMotionForgeSettings* Settings = UMotionForgeSettings::Get();
+
+	if (Character.IsNull())
+	{
+		Character = Settings->DefaultCharacter;
+	}
+
+	if (ProviderId.IsNone())
+	{
+		ProviderId = Settings->DefaultProviderId;
+	}
+
+	// Only inherit the configured model when this definition is actually going to the provider that
+	// setting belongs to. A model id is a provider's private vocabulary - stamping Uthana's
+	// "text-to-motion-3.0" onto a Kimodo definition produces a generation that fails at the far end
+	// with a name the local model has never heard of.
+	//
+	// Left empty, the provider's own default applies at submit time, which is always right.
+	if (ModelId.IsEmpty() && ProviderId == Settings->DefaultProviderId)
+	{
+		ModelId = Settings->DefaultModelId;
 	}
 }
 

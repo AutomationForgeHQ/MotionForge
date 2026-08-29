@@ -41,8 +41,17 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Character")
 	FString ProviderCharacterId;
 
-	/** Which provider the id above belongs to. Ids are not portable between providers. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Character")
+	/**
+	 * Which provider the id above belongs to. Ids are not portable between providers.
+	 *
+	 * **Leaving this empty is rarely what you want.** An empty value falls back to the project's
+	 * default provider, so a character prepared for one generator silently belongs to another - and
+	 * the rig, the id and the retargeter on it are then all being judged against the wrong one. The
+	 * Pairing checklist at the top of this asset says which provider it resolved to, and whether
+	 * that was chosen or inherited.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Character",
+		meta = (GetOptions = "/Script/MotionForge.MotionForgeSettings.GetProviderOptions"))
 	FName ProviderId;
 
 	/**

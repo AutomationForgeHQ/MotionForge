@@ -168,6 +168,21 @@ public:
 	bool BakePromptSequence(const FString& DefinitionPath, FString& OutError);
 
 	/**
+	 * Put the definition's imported animation on its prompt sequence's animation row.
+	 *
+	 * The beats above and the clip they produced below, on adjacent rows - which is the whole reason
+	 * to look at a prompt on a timeline rather than in a text field. Creating a sequence does this
+	 * already; this is the same thing for a sequence that already exists, whose row is empty because
+	 * it was built before the clip was imported, or stale because a different take was chosen since.
+	 *
+	 * Idempotent: the row is replaced, never appended to, so a stack of every take ever imported
+	 * cannot build up. Silent and successful when there is no sequence or no clip yet - neither is a
+	 * fault, and refusing would make this awkward to call speculatively, which is how it is used.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Prompt")
+	bool RefreshPromptSequenceTake(const FString& DefinitionPath, FString& OutError);
+
+	/**
 	 * Export a motion character's mesh to FBX, ready to upload to a provider.
 	 *
 	 * Providers retarget server-side against a character you have given them, so this is the first
@@ -282,6 +297,18 @@ public:
 	// Observation
 	// ---------------------------------------------------------------------------------------------
 
+	/**
+	 * Could this definition be generated right now, and if not, what is missing?
+	 *
+	 * The same checks submission makes, asked before anything is spent. A window that offers
+	 * Generate to a definition with no character is lying about what the button does, and finding
+	 * out afterwards - from an error written into the asset - is the wrong moment to learn it.
+	 *
+	 * Cheap: no network, no provider call beyond the caps it already caches.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Status")
+	FMotionReadiness CheckReadiness(const FString& AssetPath) const;
+
 	/** Per-definition status, takes and errors. Empty array means every definition. */
 	UFUNCTION(BlueprintCallable, Category = "MotionForge|Status")
 	TArray<FMotionDefinitionStatus> GetStatus(const TArray<FString>& AssetPaths) const;
@@ -363,6 +390,39 @@ public:
 
 	TSharedPtr<IMotionProvider> FindProvider(FName ProviderId) const;
 
+	// ---------------------------------------------------------------------------------------------
+	// Provider state, and telling people it moved
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * A provider's readiness changed - a container started, a pod was released, a key was set.
+	 *
+	 * Exists because caps are cached and nothing was announcing when the cache went stale. A window
+	 * showing "the runner is not up" a minute after somebody started it is not a display bug; it is
+	 * a missing signal, and every surface that draws readiness needs this one.
+	 *
+	 * Broadcast on the game thread. The argument is the provider whose state moved.
+	 */
+	DECLARE_MULTICAST_DELEGATE_OneParam(FOnMotionProviderStateChanged, FName /*ProviderId*/);
+	FOnMotionProviderStateChanged& OnProviderStateChanged() { return ProviderStateChanged; }
+
+	/**
+	 * Say a provider's state moved, so anything drawing it can catch up.
+	 *
+	 * Called by whatever did the moving - the provider itself after a health check, or an add-on
+	 * after starting a container. Cheap, and safe to call when nothing actually changed.
+	 */
+	void NotifyProviderStateChanged(FName ProviderId);
+
+	/**
+	 * Ask a provider to re-read its own readiness, and announce the result.
+	 *
+	 * The polite form for a panel that wants to be current without knowing what the provider has to
+	 * do to find out. Providers with constant caps complete immediately and announce nothing new.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Providers")
+	void RefreshProviderState(FName ProviderId);
+
 private:
 
 	/** Remove the provider-rig intermediate once the retargeted clip is saved. */
@@ -386,7 +446,8 @@ private:
 		UMotionDef* Def,
 		TSharedPtr<IMotionProvider>& OutProvider,
 		UMotionCharacter*& OutCharacter,
-		FString& OutError) const;
+		FString& OutError,
+		EMotionBlocker* OutBlocker = nullptr) const;
 
 	/** Shared implementation behind Generate and RunFullPipeline. */
 	FString StartGeneration(const TArray<FString>& AssetPaths, EMotionPipelineMode Mode);
@@ -416,11 +477,21 @@ public:
 	 * So that the thing you asked for and the thing you got are on adjacent rows: the beats above, the
 	 * animation below, and any beat that came back wrong is one glance rather than one export.
 	 *
-	 * Only ever touches a sequence the definition already points at, and only its own animation track,
-	 * which it replaces. Silent when there is no prompt sequence, no binding, or no clip - none of
-	 * those is a fault, and an import must not fail over where its result was displayed.
+	 * Only ever touches its own animation track, which it replaces. Silent when there is no prompt
+	 * sequence, no binding, or no clip - none of those is a fault, and an import must not fail over
+	 * where its result was displayed.
 	 */
 	static void PlaceTakeOnPromptSequence(UMotionDef* Def, UAnimSequence* Sequence);
+
+	/**
+	 * The same, against a sequence given rather than looked up.
+	 *
+	 * The lookup goes through `Def->Control.ConstraintSequence`, which is written by LinkDefinition -
+	 * so calling the form above during creation, before the link is made, finds nothing and returns
+	 * having done nothing. That is precisely the bug that left every freshly created prompt sequence
+	 * with an empty animation row. Anything holding the sequence already should call this.
+	 */
+	static void PlaceTakeOnSequence(class ULevelSequence* Sequence, UAnimSequence* Clip);
 
 private:
 
@@ -456,6 +527,8 @@ private:
 
 	/** The stranded-definition sweep runs once, on the first tick. See Tick for why not in Initialize. */
 	bool bSweptStrandedDefinitions = false;
+
+	FOnMotionProviderStateChanged ProviderStateChanged;
 
 	FTSTicker::FDelegateHandle TickHandle;
 	double LastPollTime = 0.0;

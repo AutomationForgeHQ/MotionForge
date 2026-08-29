@@ -1,6 +1,7 @@
 #include "MotionForgeSettings.h"
 
 #include "MotionForge.h"
+#include "MotionForgeSubsystem.h"
 #include "MotionCredentialStore.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
@@ -109,63 +110,6 @@ FMotionOutputPaths UMotionForgeSettings::SetOutputRoot(const FString& ContentPat
 	return Settings->GetOutputPaths();
 }
 
-#if WITH_EDITOR
-
-void UMotionForgeSettings::PostInitProperties()
-{
-	Super::PostInitProperties();
-
-	if (!HasAnyFlags(RF_ClassDefaultObject) || GIsEditor)
-	{
-		RefreshStatus();
-	}
-}
-
-void UMotionForgeSettings::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
-{
-	Super::PostEditChangeProperty(PropertyChangedEvent);
-
-	const FName PropertyName = PropertyChangedEvent.GetPropertyName();
-
-	if (PropertyName == GET_MEMBER_NAME_CHECKED(UMotionForgeSettings, ApiKeyEntry))
-	{
-		if (!ApiKeyEntry.IsEmpty())
-		{
-			const FString Service = CredentialProviderId.IsNone()
-				? TEXT("Uthana")
-				: CredentialProviderId.ToString();
-
-			const bool bStored = FMotionCredentialStore::Set(Service, ApiKeyEntry);
-
-			// Blank the field whether or not the write succeeded. Leaving a key sitting in a details
-			// panel invites it into a screenshot, and the property is transient so it would be lost
-			// on restart regardless - better that it visibly never persists.
-			ApiKeyEntry.Empty();
-
-			if (!bStored)
-			{
-				UE_LOG(LogMotionForge, Error,
-					TEXT("Could not store the key for '%s'. Set the %s environment variable instead."),
-					*Service, *FMotionCredentialStore::GetEnvironmentVariableName(Service));
-			}
-		}
-
-		RefreshStatus();
-	}
-	else if (PropertyName == GET_MEMBER_NAME_CHECKED(UMotionForgeSettings, CredentialProviderId))
-	{
-		RefreshStatus();
-	}
-}
-
-#endif // WITH_EDITOR
-
-void UMotionForgeSettings::RefreshStatus()
-{
-	const FString Service = CredentialProviderId.IsNone() ? TEXT("Uthana") : CredentialProviderId.ToString();
-	CredentialStatus = FMotionCredentialStore::DescribeSource(Service);
-}
-
 FString UMotionForgeSettings::GetAbsoluteStagingDirectory() const
 {
 	const FString Relative = StagingDirectory.IsEmpty() ? TEXT("Saved/MotionForge") : StagingDirectory;
@@ -210,4 +154,29 @@ bool UMotionForgeSettings::IsBlenderConfigured(FString& OutReason) const
 
 	OutReason.Reset();
 	return true;
+}
+
+TArray<FString> UMotionForgeSettings::GetProviderOptions()
+{
+	// First, so a field can always be put back. A GetOptions dropdown offers only what this returns,
+	// and without an explicit entry choosing a provider once would be irreversible - "None" parses
+	// straight to NAME_None, which is exactly what an unset field holds.
+	TArray<FString> Options{ TEXT("None") };
+
+	// Asked of the registry every time the dropdown opens, so enabling a provider plugin makes it
+	// appear without anything here being told.
+	if (const UMotionForgeSubsystem* Subsystem = UMotionForgeSubsystem::Get())
+	{
+		TArray<FString> Registered;
+		for (const FName Id : Subsystem->GetProviderIds())
+		{
+			Registered.Add(Id.ToString());
+		}
+
+		// Sorted among themselves, with None kept at the top rather than sorted into the middle.
+		Registered.Sort();
+		Options.Append(Registered);
+	}
+
+	return Options;
 }

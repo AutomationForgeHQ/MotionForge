@@ -177,6 +177,59 @@ TSharedPtr<IMotionProvider> UMotionForgeSubsystem::FindProvider(FName ProviderId
 	return Module->FindProvider(Resolved);
 }
 
+FMotionReadiness UMotionForgeSubsystem::CheckReadiness(const FString& AssetPath) const
+{
+	FMotionReadiness Readiness;
+
+	UMotionDef* Def = LoadDef(AssetPath);
+	if (!Def)
+	{
+		Readiness.Blocker = EMotionBlocker::NoProvider;
+		Readiness.Problem = FString::Printf(TEXT("No motion definition at '%s'."), *AssetPath);
+		return Readiness;
+	}
+
+	TSharedPtr<IMotionProvider> Provider;
+	UMotionCharacter* Character = nullptr;
+	FString Error;
+
+	Readiness.bCanGenerate = ResolveDefinition(Def, Provider, Character, Error, &Readiness.Blocker);
+	Readiness.Problem = Readiness.bCanGenerate ? FString() : Error;
+
+	return Readiness;
+}
+
+void UMotionForgeSubsystem::NotifyProviderStateChanged(FName ProviderId)
+{
+	// Resolved, so a listener comparing against the id it drew with always matches - a definition
+	// with no provider set is drawn with the default's caps and must still hear about them.
+	const FName Resolved = ProviderId.IsNone()
+		? UMotionForgeSettings::Get()->DefaultProviderId
+		: ProviderId;
+
+	ProviderStateChanged.Broadcast(Resolved);
+}
+
+void UMotionForgeSubsystem::RefreshProviderState(FName ProviderId)
+{
+	TSharedPtr<IMotionProvider> Provider = FindProvider(ProviderId);
+	if (!Provider.IsValid())
+	{
+		return;
+	}
+
+	const FName Resolved = Provider->GetProviderId();
+	TWeakObjectPtr<UMotionForgeSubsystem> WeakThis(this);
+
+	Provider->RefreshState([WeakThis, Resolved]()
+	{
+		if (UMotionForgeSubsystem* Self = WeakThis.Get())
+		{
+			Self->NotifyProviderStateChanged(Resolved);
+		}
+	});
+}
+
 TArray<FName> UMotionForgeSubsystem::GetProviderIds() const
 {
 	const FMotionForgeModule* Module = FMotionForgeModule::GetPtr();
@@ -254,25 +307,7 @@ FString UMotionForgeSubsystem::CreateMotionDef(const FMotionDefSpec& Spec)
 	}
 
 	Def->ApplySpec(Spec);
-
-	if (Def->Character.IsNull())
-	{
-		Def->Character = Settings->DefaultCharacter;
-	}
-	if (Def->ProviderId.IsNone())
-	{
-		Def->ProviderId = Settings->DefaultProviderId;
-	}
-	// Only inherit the configured model when this definition is actually going to the provider that
-	// setting belongs to. A model id is a provider's private vocabulary - stamping Uthana's
-	// "text-to-motion-3.0" onto a Kimodo definition produces a generation that fails at the far end
-	// with a name the local model has never heard of.
-	//
-	// Left empty, the provider's own default applies at submit time, which is always right.
-	if (Def->ModelId.IsEmpty() && Def->ProviderId == Settings->DefaultProviderId)
-	{
-		Def->ModelId = Settings->DefaultModelId;
-	}
+	Def->ApplyProjectDefaults();
 
 	FAssetRegistryModule::AssetCreated(Def);
 	SaveAsset(Def);
@@ -662,8 +697,11 @@ bool UMotionForgeSubsystem::ResolveDefinition(
 	UMotionDef* Def,
 	TSharedPtr<IMotionProvider>& OutProvider,
 	UMotionCharacter*& OutCharacter,
-	FString& OutError) const
+	FString& OutError,
+	EMotionBlocker* OutBlocker) const
 {
+	if (OutBlocker) { *OutBlocker = EMotionBlocker::None; }
+
 	const UMotionForgeSettings* Settings = UMotionForgeSettings::Get();
 
 	const FName ProviderId = Def->ProviderId.IsNone() ? Settings->DefaultProviderId : Def->ProviderId;
@@ -671,6 +709,7 @@ bool UMotionForgeSubsystem::ResolveDefinition(
 	if (!OutProvider.IsValid())
 	{
 		OutError = FString::Printf(TEXT("No provider registered as '%s'."), *ProviderId.ToString());
+		if (OutBlocker) { *OutBlocker = EMotionBlocker::NoProvider; }
 		return false;
 	}
 
@@ -680,15 +719,19 @@ bool UMotionForgeSubsystem::ResolveDefinition(
 	// free path unusable in exactly the case it exists for.
 	if (Caps.bNeedsCredential && !OutProvider->HasCredential())
 	{
+		// Keys moved to Editor Preferences, and there is a Keys page now. The old sentence sent
+		// people to a settings page that no longer holds them.
 		OutError = FString::Printf(
-			TEXT("No API key for %s. Set one in Project Settings > Plugins > MotionForge."),
+			TEXT("No API key for %s. Set one on the Keys page, or in Editor Preferences."),
 			*OutProvider->GetDisplayName());
+		if (OutBlocker) { *OutBlocker = EMotionBlocker::NoCredential; }
 		return false;
 	}
 
 	if (!Caps.SetupHint.IsEmpty())
 	{
 		OutError = FString::Printf(TEXT("%s is not ready: %s"), *OutProvider->GetDisplayName(), *Caps.SetupHint);
+		if (OutBlocker) { *OutBlocker = EMotionBlocker::ProviderNotReady; }
 		return false;
 	}
 
@@ -697,6 +740,7 @@ bool UMotionForgeSubsystem::ResolveDefinition(
 	if (!OutCharacter)
 	{
 		OutError = TEXT("No Motion Character set, and no default configured in settings.");
+		if (OutBlocker) { *OutBlocker = EMotionBlocker::NoCharacter; }
 		return false;
 	}
 
@@ -705,6 +749,7 @@ bool UMotionForgeSubsystem::ResolveDefinition(
 	{
 		OutError = FString::Printf(TEXT("Character '%s' is not usable with %s: %s"),
 			*OutCharacter->GetDisplayName(), *OutProvider->GetDisplayName(), *CharacterReason);
+		if (OutBlocker) { *OutBlocker = EMotionBlocker::CharacterUnusable; }
 		return false;
 	}
 
@@ -714,6 +759,7 @@ bool UMotionForgeSubsystem::ResolveDefinition(
 	if (Def->Prompt.IsEmpty() && FMotionPromptSequence::FindTrack(Def->Control.ConstraintSequence.LoadSynchronous()) == nullptr)
 	{
 		OutError = TEXT("Prompt is empty.");
+		if (OutBlocker) { *OutBlocker = EMotionBlocker::NoPrompt; }
 		return false;
 	}
 
@@ -1778,9 +1824,29 @@ TArray<FMotionDefinitionStatus> UMotionForgeSubsystem::GetStatus(const TArray<FS
 		Entry.Status = Def->Status;
 		Entry.Prompt = Def->Prompt;
 		Entry.Length = Def->Length;
+		Entry.Variants = Def->Variants;
 		Entry.SelectedMotionId = Def->SelectedMotionId;
 		Entry.LastError = Def->LastError;
 		Entry.ImportedSequencePath = Def->ImportedSequence.ToString();
+
+		// Resolved, and flagged when it was inherited. A definition naming no provider is not a
+		// definition with no provider - it follows the project default, and which one it landed on is
+		// the fact worth reporting.
+		Entry.bProviderInherited = Def->ProviderId.IsNone();
+		Entry.ProviderId = Entry.bProviderInherited
+			? UMotionForgeSettings::Get()->DefaultProviderId
+			: Def->ProviderId;
+
+		// Ready with nothing to show for it. The status records what the pipeline did and stays true
+		// after the clip is deleted, so the registry is the only thing that knows.
+		if (!Entry.ImportedSequencePath.IsEmpty())
+		{
+			const FAssetRegistryModule& AssetRegistry =
+				FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+
+			Entry.bImportedSequenceMissing =
+				!AssetRegistry.Get().GetAssetByObjectPath(FSoftObjectPath(Entry.ImportedSequencePath)).IsValid();
+		}
 
 		Entry.Takes.Reserve(Def->Candidates.Num());
 		for (const FMotionCandidate& Candidate : Def->Candidates)
@@ -1960,9 +2026,13 @@ FString UMotionForgeSubsystem::GetStatusJson(const TArray<FString>& AssetPaths) 
 		Entry->SetStringField(TEXT("status"), MotionForgeJson::StatusToString(Definition.Status));
 		Entry->SetStringField(TEXT("prompt"), Definition.Prompt);
 		Entry->SetNumberField(TEXT("length"), Definition.Length);
+		Entry->SetNumberField(TEXT("variants"), Definition.Variants);
+		Entry->SetStringField(TEXT("provider"), Definition.ProviderId.ToString());
+		Entry->SetBoolField(TEXT("providerInherited"), Definition.bProviderInherited);
 		Entry->SetStringField(TEXT("selectedMotionId"), Definition.SelectedMotionId);
 		Entry->SetStringField(TEXT("lastError"), Definition.LastError);
 		Entry->SetStringField(TEXT("sequence"), Definition.ImportedSequencePath);
+		Entry->SetBoolField(TEXT("sequenceMissing"), Definition.bImportedSequenceMissing);
 
 		TArray<TSharedPtr<FJsonValue>> TakeValues;
 		for (const FMotionTakeInfo& Take : Definition.Takes)

@@ -27,6 +27,7 @@ public:
 	virtual FName GetProviderId() const override { return ProviderId; }
 	virtual FString GetDisplayName() const override { return TEXT("Uthana"); }
 	virtual FString GetCredentialServiceName() const override { return TEXT("Uthana"); }
+	virtual FString GetCredentialHelpUrl() const override { return TEXT("https://www.uthana.com"); }
 	virtual FString GetDefaultModelId() const override { return TEXT("text-to-motion-3.0"); }
 
 	virtual FMotionProviderCaps GetCaps() const override;

@@ -205,6 +205,58 @@ public:
 	/** Service name this provider's secret is stored under in the credential vault. */
 	virtual FString GetCredentialServiceName() const = 0;
 
+	/**
+	 * Where a person signs up for a key, shown beside the field that asks for one.
+	 * Optional — a provider that needs no account, or has no sign-up page, leaves it empty.
+	 */
+	virtual FString GetCredentialHelpUrl() const { return FString(); }
+
+	/**
+	 * What this provider's key is for, in one line, where the generic sentence would mislead.
+	 * Empty means "motion generation through this provider", which is true of the hosted ones.
+	 */
+	virtual FText GetCredentialPurpose() const { return FText(); }
+
+	/**
+	 * True when the provider works without a key — a runner on loopback, for instance, where
+	 * demanding a token would be ceremony. Says so on the Keys page instead of implying a fault.
+	 */
+	virtual bool IsCredentialOptional() const { return false; }
+
+	/**
+	 * The name of the place a person sets this provider up, when it has one beyond a key.
+	 *
+	 * Empty for a hosted service, where an API key is the whole of it. A provider that runs on
+	 * hardware somebody has to manage - a container to start, a GPU to rent - has more to say, and
+	 * this is how it offers it without MotionForge knowing what a container is.
+	 *
+	 * MotionForge asks the provider rather than looking for a plugin by name, so a provider added
+	 * later gets the same button with no change here. The one rule is the family's: an add-on may
+	 * be absent, so an empty answer must remain perfectly ordinary.
+	 */
+	virtual FText GetSetupSurfaceLabel() const { return FText(); }
+
+	/**
+	 * Open that place. Called only when the label above is non-empty.
+	 *
+	 * The provider does the opening, because only it knows what it registered - a tab, a window, a
+	 * settings page. Nothing above needs to learn.
+	 */
+	virtual void OpenSetupSurface() const {}
+
+	/**
+	 * Re-read whatever this provider caches about its own readiness, then call back.
+	 *
+	 * `GetCaps` is answered from a cache, because it is called every frame by anything drawing a
+	 * panel. That cache is why a runner somebody started a minute ago could still be reported as
+	 * down: nothing had asked it since. Anything that shows readiness should call this on a slow
+	 * timer rather than trusting what it was told when it opened.
+	 *
+	 * Default is a no-op that completes immediately, which is correct for a provider whose caps are
+	 * constants. Keep the work small - a single health call, not a shell out.
+	 */
+	virtual void RefreshState(TFunction<void()> OnDone) { OnDone(); }
+
 	/** Model used when a definition names none. */
 	virtual FString GetDefaultModelId() const = 0;
 

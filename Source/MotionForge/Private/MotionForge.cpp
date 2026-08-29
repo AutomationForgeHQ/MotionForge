@@ -1,5 +1,8 @@
 #include "MotionForge.h"
 
+#if WITH_FORGE_KEYS
+#include "ForgeKeyRegistry.h"
+#endif
 #include "MotionCredentialStore.h"
 #include "MotionForgeSettings.h"
 #include "MotionForgeSubsystem.h"
@@ -207,6 +210,55 @@ void FMotionForgeModule::RegisterProvider(TSharedRef<IMotionProvider> Provider)
 	UE_LOG(LogMotionForge, Log, TEXT("Provider '%s' %s."),
 		*Id.ToString(), bReplaced ? TEXT("re-registered") : TEXT("registered"));
 
+	// Offer this provider's key to the shared Keys page — if ForgeKeys happens to be installed.
+	// MotionForge does not link it and does not require it: without it this is a null check and the
+	// key is still set on MotionForge's own settings page, which is the path that always works.
+#if WITH_FORGE_KEYS
+	if (IForgeKeysModule* Keys = IForgeKeysModule::GetOrLoad())
+	{
+		const FString Service = Provider->GetCredentialServiceName();
+		const FString Display = Provider->GetDisplayName();
+
+		FForgeKeyProvider Key;
+		Key.Id = FName(*FString::Printf(TEXT("MotionForge.%s"), *Id.ToString()));
+		Key.DisplayName = FText::FromString(Display);
+		Key.Owner = LOCTEXT("MotionForgeOwner", "MotionForge");
+		Key.Purpose = Provider->GetCredentialPurpose().IsEmpty()
+			? FText::Format(
+				LOCTEXT("MotionKeyPurpose", "Motion generation through {0}. Without it this provider cannot be used."),
+				FText::FromString(Display))
+			: Provider->GetCredentialPurpose();
+		Key.bOptional = Provider->IsCredentialOptional();
+		Key.HelpUrl = Provider->GetCredentialHelpUrl();
+		Key.VaultEntryName = FString::Printf(TEXT("MotionForge/%s"), *Service);
+		Key.EnvironmentVariableName = FMotionCredentialStore::GetEnvironmentVariableName(Service);
+
+		// The operations stay here, on MotionForge's own store. ForgeKeys holds no vault code.
+		Key.IsSet    = [Service]() { return FMotionCredentialStore::Has(Service); };
+		Key.Describe = [Service]() { return FMotionCredentialStore::DescribeSource(Service); };
+		Key.Store    = [Service](const FString& Secret) { return FMotionCredentialStore::Set(Service, Secret); };
+		Key.Clear    = [Service]() { return FMotionCredentialStore::Remove(Service); };
+
+		// Weak, so a provider whose plugin unloaded mid-test cannot be called through a dangling handle.
+		TWeakPtr<IMotionProvider> WeakProvider = Provider.ToSharedPtr();
+		Key.Test = [WeakProvider](FForgeKeyTestResult Done)
+		{
+			if (TSharedPtr<IMotionProvider> Pinned = WeakProvider.Pin())
+			{
+				Pinned->TestConnection([Done](bool bSuccess, const FString& Message)
+				{
+					Done(bSuccess, FText::FromString(Message));
+				});
+			}
+			else
+			{
+				Done(false, LOCTEXT("ProviderGone", "That provider is no longer loaded."));
+			}
+		};
+		Keys->Registry().Register(MoveTemp(Key));
+	}
+#endif
+
 	OnProvidersChanged.Broadcast();
 }
 
@@ -215,6 +267,12 @@ void FMotionForgeModule::UnregisterProvider(FName ProviderId)
 	if (Providers.Remove(ProviderId) > 0)
 	{
 		UE_LOG(LogMotionForge, Log, TEXT("Provider '%s' unregistered."), *ProviderId.ToString());
+#if WITH_FORGE_KEYS
+		if (IForgeKeysModule* Keys = IForgeKeysModule::GetIfLoaded())
+		{
+			Keys->Registry().Unregister(FName(*FString::Printf(TEXT("MotionForge.%s"), *ProviderId.ToString())));
+		}
+#endif
 		OnProvidersChanged.Broadcast();
 	}
 }

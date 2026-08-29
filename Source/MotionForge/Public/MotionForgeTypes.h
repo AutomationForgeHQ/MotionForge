@@ -146,9 +146,13 @@ struct MOTIONFORGE_API FMotionDefSpec
 	 *
 	 * A spending decision wherever generated seconds are what bill: each variant is another
 	 * Length seconds charged at submission, kept or discarded. Free on a subscription.
+	 *
+	 * **Defaults to one**, so a caller that omits it cannot be charged a multiple it did not ask for.
+	 * Ask for more only after reading the provider's billing model - EstimateGenerationCost answers
+	 * before anything is submitted, and on an unmetered provider the answer is zero.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec", meta = (ClampMin = 1))
-	int32 Variants = 4;
+	int32 Variants = 1;
 
 	/**
 	 * Let the provider rewrite the prompt into its own phrasing before generating.
@@ -164,7 +168,8 @@ struct MOTIONFORGE_API FMotionDefSpec
 	FString CharacterAssetPath;
 
 	/** Empty uses the settings default. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec",
+		meta = (GetOptions = "/Script/MotionForge.MotionForgeSettings.GetProviderOptions"))
 	FName ProviderId;
 
 	/** Empty uses the provider's default model. */
@@ -282,6 +287,29 @@ struct MOTIONFORGE_API FMotionDefinitionStatus
 	UPROPERTY(BlueprintReadOnly, Category = "Definition")
 	int32 Length = 0;
 
+	/** How many takes a generation would produce, and therefore what one would cost. */
+	UPROPERTY(BlueprintReadOnly, Category = "Definition")
+	int32 Variants = 1;
+
+	/**
+	 * The provider this definition will actually generate on, resolved.
+	 *
+	 * Never None on a working project: a definition naming no provider uses the project's default,
+	 * and reporting the blank would hide which one is about to be billed.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Definition")
+	FName ProviderId;
+
+	/**
+	 * True when the provider above was inherited rather than chosen on this definition.
+	 *
+	 * The two are different facts and a library that draws them alike is how a definition made for
+	 * one provider quietly generates on another - changing the project default silently moves every
+	 * inherited definition with it.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Definition")
+	bool bProviderInherited = false;
+
 	/** Empty until a take is chosen. */
 	UPROPERTY(BlueprintReadOnly, Category = "Definition")
 	FString SelectedMotionId;
@@ -293,6 +321,16 @@ struct MOTIONFORGE_API FMotionDefinitionStatus
 	/** The imported animation, once Status is Ready. Empty before that. */
 	UPROPERTY(BlueprintReadOnly, Category = "Definition")
 	FString ImportedSequencePath;
+
+	/**
+	 * The path above names an asset that is no longer in the project.
+	 *
+	 * A definition still reporting Ready whose clip was deleted, moved or never saved. Nothing else
+	 * catches it - the status is stored on the definition and stays true to what the pipeline did,
+	 * so only asking the asset registry can tell you the result is gone.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Definition")
+	bool bImportedSequenceMissing = false;
 
 	/** Every take ever generated for this definition. Never pruned. */
 	UPROPERTY(BlueprintReadOnly, Category = "Definition")
@@ -513,6 +551,48 @@ struct MOTIONFORGE_API FMotionProviderCaps
 	/** What a human must do before this provider will work, when it is not ready. Empty when it is. */
 	UPROPERTY(BlueprintReadOnly, Category = "Provider")
 	FString SetupHint;
+};
+
+/**
+ * The one reason a definition cannot be generated, when there is one.
+ *
+ * A kind rather than only a sentence, because each of these has a different next action and the
+ * panel should offer *that* one - a missing key wants the Keys page, a runner that is down wants
+ * the runner panel, and a missing character wants the field above.
+ */
+UENUM(BlueprintType)
+enum class EMotionBlocker : uint8
+{
+	None				UMETA(DisplayName = "None"),
+	NoProvider			UMETA(DisplayName = "No Provider"),
+	NoCredential		UMETA(DisplayName = "No Credential"),
+	ProviderNotReady	UMETA(DisplayName = "Provider Not Ready"),
+	NoCharacter			UMETA(DisplayName = "No Character"),
+	CharacterUnusable	UMETA(DisplayName = "Character Unusable"),
+	NoPrompt			UMETA(DisplayName = "No Prompt")
+};
+
+/**
+ * Whether a definition could be generated right now, asked before anything is spent.
+ *
+ * Everything here was already checked at submit time and reported as a failure afterwards, which
+ * is the wrong moment: a window that offers Generate to a definition with no character is lying
+ * about what the button will do. Same answer either way, because this asks the same code.
+ */
+USTRUCT(BlueprintType)
+struct MOTIONFORGE_API FMotionReadiness
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Readiness")
+	bool bCanGenerate = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Readiness")
+	EMotionBlocker Blocker = EMotionBlocker::None;
+
+	/** What is missing, in one sentence. Empty when nothing is. */
+	UPROPERTY(BlueprintReadOnly, Category = "Readiness")
+	FString Problem;
 };
 
 /** Whether a provider can be used, without revealing how. */

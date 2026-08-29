@@ -1439,13 +1439,6 @@ FString UMotionForgeSubsystem::CreatePromptSequence(
 		UE_LOG(LogMotionForge, Warning, TEXT("%s"), *ConstraintError);
 	}
 
-	// And the take it already has, on the animation row.
-	//
-	// A definition generated before anyone thought to build a sequence for it still has its clip, and
-	// leaving the row empty means either spending a generation to fill it or wiring it up by hand -
-	// the second being the kind of manual step that quietly attaches the wrong animation.
-	PlaceTakeOnPromptSequence(Def, Def->ImportedSequence.LoadSynchronous());
-
 	if (bIsNew)
 	{
 		FAssetRegistryModule::AssetCreated(Sequence);
@@ -1461,6 +1454,17 @@ FString UMotionForgeSubsystem::CreatePromptSequence(
 		OutError = LinkError;
 		return FString();
 	}
+
+	// And the take it already has, on the animation row.
+	//
+	// A definition generated before anyone thought to build a sequence for it still has its clip, and
+	// leaving the row empty means either spending a generation to fill it or wiring it up by hand -
+	// the second being the kind of manual step that quietly attaches the wrong animation.
+	//
+	// After the link, and against the sequence in hand rather than the one the definition points at.
+	// This used to run above, where the definition did not yet point anywhere, so it found nothing
+	// and every newly created sequence opened with an empty animation row.
+	PlaceTakeOnSequence(Sequence, Def->ImportedSequence.LoadSynchronous());
 
 	SaveAsset(Sequence);
 	SaveAsset(Def);
@@ -1486,6 +1490,23 @@ FMotionPromptRead UMotionForgeSubsystem::ReadPromptSequence(
 	FMotionPromptSequence::Resolve(Def, ResolveFrameRate(Provider), Result, OutError);
 
 	return Result;
+}
+
+bool UMotionForgeSubsystem::RefreshPromptSequenceTake(const FString& DefinitionPath, FString& OutError)
+{
+	OutError.Reset();
+
+	UMotionDef* Def = LoadDef(DefinitionPath);
+	if (Def == nullptr)
+	{
+		OutError = FString::Printf(TEXT("No motion definition at '%s'."), *DefinitionPath);
+		return false;
+	}
+
+	// Neither a missing sequence nor a missing clip is a fault - this is called speculatively every
+	// time somebody opens a timeline, and refusing would turn "nothing to do" into an error to read.
+	PlaceTakeOnPromptSequence(Def, Def->ImportedSequence.LoadSynchronous());
+	return true;
 }
 
 bool UMotionForgeSubsystem::BakePromptSequence(const FString& DefinitionPath, FString& OutError)
@@ -1599,13 +1620,22 @@ bool UMotionForgeSubsystem::BakePromptSequence(const FString& DefinitionPath, FS
 
 void UMotionForgeSubsystem::PlaceTakeOnPromptSequence(UMotionDef* Def, UAnimSequence* Clip)
 {
-	if (Def == nullptr || Clip == nullptr)
+	if (Def == nullptr)
 	{
 		return;
 	}
 
-	ULevelSequence* Sequence = Def->Control.ConstraintSequence.LoadSynchronous();
-	if (Sequence == nullptr || FMotionPromptSequence::FindTrack(Sequence) == nullptr)
+	PlaceTakeOnSequence(Def->Control.ConstraintSequence.LoadSynchronous(), Clip);
+}
+
+void UMotionForgeSubsystem::PlaceTakeOnSequence(ULevelSequence* Sequence, UAnimSequence* Clip)
+{
+	if (Sequence == nullptr || Clip == nullptr)
+	{
+		return;
+	}
+
+	if (FMotionPromptSequence::FindTrack(Sequence) == nullptr)
 	{
 		return;
 	}

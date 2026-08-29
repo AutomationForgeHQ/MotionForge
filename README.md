@@ -751,3 +751,72 @@ discussion.
 
 `FMotionForgeModule` holds the provider registry, so an add-on plugin registers itself at module
 startup and this plugin never learns its name.
+
+---
+
+## The editor surface
+
+Added 2026-08-29. Everything here is a thin layer over `UMotionForgeSubsystem`,
+so an agent reaches all of it too — that is rule 5, and it has no exceptions.
+
+**A Motion Definition opens into a window.** The prompt first and large, because
+the prompt is the work; the provider a list of what is actually installed;
+length, variants and character as pickers; the whole `Control` tree behind
+*Advanced*. On the right, the takes: status in a sentence, what a generation
+would cost before it is spent, and a card per take carrying the motion id — the
+only route back to a take on a provider that cannot reproduce one — and a single
+*Choose*. Generate, Import, Prompt Timeline and Show Animation are on the
+toolbar.
+
+**Generate is offered only when it would work.** `CheckReadiness` asks the same
+six questions submission asks — provider, credential, provider ready, character,
+character usable, prompt — so the button greys out with the reason in its
+tooltip instead of failing after the click. A missing key gets a button to the
+Keys page.
+
+**A provider that runs on hardware can offer its own setup.** Implement
+`GetSetupSurfaceLabel` and `OpenSetupSurface` on `IMotionProvider` and the
+definition window grows an *Open …* button, leading when the provider says it is
+not ready. MotionForge never learns what the provider is managing; Kimodo's
+answer happens to be a Docker container or a rented GPU.
+
+**Readiness stays current.** `OnProviderStateChanged` covers anything done
+inside the editor, a ten-second `RefreshState` poll covers what it cannot see —
+a container stopped from a terminal, a pod released elsewhere — and there is a
+refresh button because both will still miss something.
+
+**A Motion Character is a checklist, not ten fields.** Pairing is five steps of
+which four must happen in order, and which of them exist depends on the
+provider: a service that retargets on its own hardware wants a character
+uploaded and an id back; one that generates on a fixed rig wants neither.
+
+The one thing worth knowing before reading that page: **`Provider Mesh` is not a
+required field.** Its presence chooses the pipeline — empty imports straight onto
+the target skeleton, set imports onto the provider's rig and retargets. Both are
+finished configurations.
+
+**The library.** *Tools ▸ Automation Forge ▸ Motion Library*, or
+`MotionForge.Library`. Every definition in the project on one list: its state,
+which provider it will actually use, how many takes it has, the animation it
+produced, and its prompt. Filters carry their own counts. Sort by name, state or
+provider; search names and prompts; double-click to open.
+
+Two things it does that a folder of icons cannot:
+
+- **A selection is priced before it is spent.** Select five definitions and the
+  footer says what generating them would cost, per the providers they each
+  resolve to, before the button is pressed. Generate is offered only for the
+  ones that would actually work, and says so when none would.
+- **It catches a result that is gone.** A definition's status records what the
+  pipeline did and stays true after somebody deletes the clip, so a library can
+  be full of definitions claiming *Ready* with nothing to show. The library asks
+  the asset registry instead of believing the status, and says so in red — as
+  does `GetMotionStatus`, through `bImportedSequenceMissing`.
+
+**Creating either asset.** Right-click in the Content Browser ▸ *Automation
+Forge ▸ MotionForge ▸ Motion Definition* (or *Motion Character*), or **New
+Definition** in the library. Before 0.2.0 there was no factory, so the only
+route was *Miscellaneous ▸ Data Asset* and finding the class in a list of every
+data asset class in the project. Both routes now apply the same project defaults
+through `UMotionDef::ApplyProjectDefaults`, which is what `CreateMotionDef` uses
+— a definition made by hand is not subtly different from one an agent authored.

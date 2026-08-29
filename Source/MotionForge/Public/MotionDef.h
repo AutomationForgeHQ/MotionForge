@@ -58,9 +58,18 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion")
 	int32 Length = 5;
 
-	/** How many takes to generate. Free wherever generation is unmetered - be generous. */
+	/**
+	 * How many takes to generate.
+	 *
+	 * **One by default, and deliberately so.** On a pay-as-you-go provider every variant is billed the
+	 * moment it is submitted, kept or discarded - so a default of four charges four times for a
+	 * definition somebody made to try a single idea. That bill has already been paid once here.
+	 *
+	 * Raise it freely where generation is unmetered: a local runner costs nothing, more takes is
+	 * strictly better, and the cost line in the editor says which case you are in before you spend.
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion", meta = (ClampMin = 1, ClampMax = 16))
-	int32 Variants = 4;
+	int32 Variants = 1;
 
 	/**
 	 * Let the provider rewrite the prompt before generating.
@@ -101,7 +110,8 @@ public:
 	TSoftObjectPtr<UIKRetargeter> RetargeterOverride;
 
 	/** Which provider to use. Falls back to the settings default when unset. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Advanced")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Advanced",
+		meta = (GetOptions = "/Script/MotionForge.MotionForgeSettings.GetProviderOptions"))
 	FName ProviderId;
 
 	/** Provider model identifier. Falls back to the provider's default when empty. */
@@ -177,6 +187,16 @@ public:
 
 	/** Apply an authoring spec, leaving pipeline state untouched. */
 	void ApplySpec(const FMotionDefSpec& Spec);
+
+	/**
+	 * Fill in the project's defaults for whatever is still unset - character, provider, and the model
+	 * id where it belongs to that provider. Never overwrites a field that has been chosen.
+	 *
+	 * Called on every newly created definition, whether an agent made it through CreateMotionDef or a
+	 * person made one in the Content Browser, so both arrive configured the same way. A definition
+	 * created by hand that skipped this looked identical and generated against nothing.
+	 */
+	void ApplyProjectDefaults();
 
 	/** Move to a new status, recording an error when moving to Failed. */
 	void SetStatus(EMotionDefStatus NewStatus, const FString& Error = FString());
