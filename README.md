@@ -813,6 +813,12 @@ Two things it does that a folder of icons cannot:
   the asset registry instead of believing the status, and says so in red — as
   does `GetMotionStatus`, through `bImportedSequenceMissing`.
 
+**Keys reach two surfaces.** `Config/ForgeMachine.json` declares the Uthana key —
+what it is for, where to get one, the Credential Manager entry, the environment
+variable. The editor's Keys page reads it, and so does the Automation Forge hub,
+which is a separate application and can therefore set a key before an editor is
+open. Same vault entry either way.
+
 **Creating either asset.** Right-click in the Content Browser ▸ *Automation
 Forge ▸ MotionForge ▸ Motion Definition* (or *Motion Character*), or **New
 Definition** in the library. Before 0.2.0 there was no factory, so the only
