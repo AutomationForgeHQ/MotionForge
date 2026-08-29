@@ -1,7 +1,7 @@
 {
   "FileVersion": 3,
   "Version": 1,
-  "VersionName": "0.1.0\r",
+  "VersionName": "0.1.0",
   "FriendlyName": "MotionForge",
   "Description": "Describe a motion, generate it with an AI motion provider, and get a game-ready animation sequence imported onto the skeleton you chose. Owns one pipeline end to end - submit, poll, review, download, normalise in Blender, import. Standalone: no gameplay framework dependency, no montages, no curves, no notifies. Those belong to adapters built on top.",
   "Category": "Content Pipeline",
