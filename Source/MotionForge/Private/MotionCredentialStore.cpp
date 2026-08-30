@@ -11,10 +11,48 @@
 
 namespace MotionForgeCredentials
 {
+	/**
+	 * Services that are not this plugin's, they are the family's.
+	 *
+	 * A Runpod key and a Hugging Face token are accounts a *person* has, not things a plugin owns, so
+	 * naming their vault entries after whichever plugin happened to ask first was wrong: install a
+	 * second plugin that rents GPUs and you are asked for the same key again, and now there are two
+	 * copies to keep in step. These live under one family-wide name that every plugin agrees on.
+	 *
+	 * Agreeing on a *name* is not a dependency. Each plugin still carries its own vault code and works
+	 * alone; they simply write to the same drawer.
+	 */
+	static const TCHAR* SharedNamespace = TEXT("AutomationForge");
+
+	static FString SharedServiceFor(const FString& Service)
+	{
+		if (Service.Equals(TEXT("KimodoRunpod"), ESearchCase::IgnoreCase))       { return TEXT("Runpod"); }
+		if (Service.Equals(TEXT("KimodoHuggingFace"), ESearchCase::IgnoreCase))  { return TEXT("HuggingFace"); }
+		return FString();
+	}
+
 	/** Vault entries are namespaced so they are recognisable in the Windows credential list. */
 	static FString MakeTargetName(const FString& Service)
 	{
-		return FString::Printf(TEXT("MotionForge/%s"), *Service);
+		const FString Shared = SharedServiceFor(Service);
+
+		return Shared.IsEmpty()
+			? FString::Printf(TEXT("MotionForge/%s"), *Service)
+			: FString::Printf(TEXT("%s/%s"), SharedNamespace, *Shared);
+	}
+
+	/**
+	 * Where a shared key used to live, or empty when it never moved.
+	 *
+	 * Read-only and deliberately so. A key already in the old entry keeps working, and gets written to
+	 * the new one the next time somebody saves it - which is a migration nobody has to perform and
+	 * nothing that copies a secret around behind their back.
+	 */
+	static FString LegacyTargetName(const FString& Service)
+	{
+		return SharedServiceFor(Service).IsEmpty()
+			? FString()
+			: FString::Printf(TEXT("MotionForge/%s"), *Service);
 	}
 }
 
@@ -45,7 +83,21 @@ bool FMotionCredentialStore::Get(const FString& Service, FString& OutSecret)
 	}
 
 #if PLATFORM_WINDOWS
-	const FString Target = MotionForgeCredentials::MakeTargetName(Service);
+	FString Target = MotionForgeCredentials::MakeTargetName(Service);
+
+	// A key stored before these two moved to the family-wide name is still a key the user gave us.
+	const FString Legacy = MotionForgeCredentials::LegacyTargetName(Service);
+	if (!Legacy.IsEmpty())
+	{
+		PCREDENTIALW Probe = nullptr;
+		const bool bHasCurrent = ::CredReadW(*Target, CRED_TYPE_GENERIC, 0, &Probe) && Probe;
+		if (Probe) { ::CredFree(Probe); }
+
+		if (!bHasCurrent)
+		{
+			Target = Legacy;
+		}
+	}
 
 	PCREDENTIALW Credential = nullptr;
 	if (::CredReadW(*Target, CRED_TYPE_GENERIC, 0, &Credential) && Credential)

@@ -288,7 +288,7 @@ struct MOTIONFORGE_API FMotionProvenanceRow
 	/**
 	 * Everything done to the clip after generation, oldest first, as step ids.
 	 *
-	 * **The answer to "was this corrected, or is it raw?"** - which nothing in the animation itself
+	 * The answer to "was this corrected, or is it raw?" - which nothing in the animation itself
 	 * can tell you, and which decides whether a clip is comparable with the one beside it.
 	 */
 	UPROPERTY(BlueprintReadOnly, Category = "Provenance") TArray<FName> Processing;

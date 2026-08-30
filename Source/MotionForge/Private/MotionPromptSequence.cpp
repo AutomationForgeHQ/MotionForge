@@ -1327,7 +1327,7 @@ EMotionPromptSync FMotionPromptSequence::GetSyncState(
 	}
 
 	OutDetail = FString::Printf(
-		TEXT("%d beat(s) here against %d on '%s'. **This sequence is what generates** - that is the "
+		TEXT("%d beat(s) here against %d on '%s'. This sequence is what generates - that is the "
 			 "normal state, not a fault. Bake to write these back onto the asset, for the day the "
 			 "sequence goes away."),
 		Beats.Num(), Definition->Control.BeatSeconds.Num(), *Definition->GetName());
