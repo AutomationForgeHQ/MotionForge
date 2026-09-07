@@ -61,11 +61,17 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Provider",
 		meta = (GetOptions = "GetProviderOptions"))
-	FName DefaultProviderId = TEXT("Uthana");
+	FName DefaultProviderId = NAME_None;
 
-	/** Model new definitions use when they do not name one. */
+	/**
+	 * Model new definitions use when they do not name one.
+	 *
+	 * Empty on purpose: a model id is a provider's private vocabulary, so a core that ships no
+	 * provider has no business naming one. Left empty, the provider's own default applies at
+	 * submit time, which is always right.
+	 */
 	UPROPERTY(config, EditAnywhere, Category = "Provider")
-	FString DefaultModelId = TEXT("text-to-motion-3.0");
+	FString DefaultModelId;
 
 	/** Character new definitions use when they do not name one. */
 	UPROPERTY(config, EditAnywhere, Category = "Provider")

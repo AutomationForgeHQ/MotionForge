@@ -39,7 +39,7 @@ public:
 
 	/** Which provider the fields below act on. */
 	UPROPERTY(Transient, EditAnywhere, Category = "Credentials")
-	FName CredentialProviderId = TEXT("Uthana");
+	FName CredentialProviderId = NAME_None;
 
 	/**
 	 * Paste an API key here to sign in.

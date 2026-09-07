@@ -61,6 +61,20 @@ public:
 	TSharedPtr<IMotionProvider> FindProvider(FName ProviderId) const;
 	TArray<FName> GetProviderIds() const;
 
+	/**
+	 * The provider to use when nothing names one.
+	 *
+	 * The settings value when it is set; otherwise the sole registered provider, because a machine
+	 * with exactly one provider plugin enabled has already made the choice. With several registered
+	 * and none named this returns NAME_None and the caller reports rather than picking - providers
+	 * bill different accounts, and a silent guess spends the wrong one.
+	 *
+	 * This exists because the setting used to default to a vendor by name, which meant the core
+	 * could not be built without that vendor's plugin mattering. It defaults to None now, and this
+	 * is the one place that decides what None means.
+	 */
+	FName ResolveDefaultProviderId() const;
+
 	DECLARE_MULTICAST_DELEGATE(FOnProvidersChanged);
 	FOnProvidersChanged OnProvidersChanged;
 

@@ -7,7 +7,6 @@
 #include "MotionForgeSettings.h"
 #include "MotionForgeSubsystem.h"
 #include "IMotionProvider.h"
-#include "Providers/UthanaProvider.h"
 #include "HAL/IConsoleManager.h"
 
 DEFINE_LOG_CATEGORY(LogMotionForge);
@@ -32,8 +31,8 @@ namespace MotionForgeConsole
 			return FName(*Args[0]);
 		}
 
-		const UMotionForgeSettings* Settings = UMotionForgeSettings::Get();
-		return Settings->DefaultProviderId.IsNone() ? FName(TEXT("Uthana")) : Settings->DefaultProviderId;
+		FMotionForgeModule* Module = FMotionForgeModule::GetPtr();
+		return Module ? Module->ResolveDefaultProviderId() : NAME_None;
 	}
 
 	static void TestConnection(const TArray<FString>& Args)
@@ -222,7 +221,7 @@ void FMotionForgeModule::RegisterProvider(TSharedRef<IMotionProvider> Provider)
 		FForgeKeyProvider Key;
 		Key.Id = FName(*FString::Printf(TEXT("MotionForge.%s"), *Id.ToString()));
 		Key.DisplayName = FText::FromString(Display);
-		Key.Owner = LOCTEXT("MotionForgeOwner", "MotionForge");
+		Key.Owner = Provider->GetOwningPluginName();
 		Key.Purpose = Provider->GetCredentialPurpose().IsEmpty()
 			? FText::Format(
 				LOCTEXT("MotionKeyPurpose", "Motion generation through {0}. Without it this provider cannot be used."),
@@ -291,11 +290,32 @@ TArray<FName> FMotionForgeModule::GetProviderIds() const
 	return Ids;
 }
 
+FName FMotionForgeModule::ResolveDefaultProviderId() const
+{
+	if (const UMotionForgeSettings* Settings = UMotionForgeSettings::Get())
+	{
+		if (!Settings->DefaultProviderId.IsNone())
+		{
+			return Settings->DefaultProviderId;
+		}
+	}
+
+	if (Providers.Num() == 1)
+	{
+		for (const auto& Pair : Providers)
+		{
+			return Pair.Key;
+		}
+	}
+
+	return NAME_None;
+}
+
 void FMotionForgeModule::StartupModule()
 {
-	// Uthana goes through the same registry an add-on uses. Keeping the first-party provider on a
-	// private path would let the registry rot untested until the day someone needed it.
-	RegisterProvider(MakeShared<FUthanaProvider>());
+	// No provider is registered here, and that is the point. Every provider - Uthana included, since
+	// its extraction into MotionForgeUthana - is a separate plugin that registers itself at module
+	// startup, and this module never learns any of their names.
 }
 
 void FMotionForgeModule::ShutdownModule()

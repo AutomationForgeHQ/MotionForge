@@ -90,7 +90,7 @@ characters, say — where the rigs genuinely differ. See [Retargeting](#retarget
 
 | Field | |
 |---|---|
-| **Credential Provider Id** | Which provider the fields below act on. `Uthana` by default. |
+| **Credential Provider Id** | Which provider the fields below act on. Empty means whichever provider is the default. |
 | **API Key** | Paste and commit. Stored immediately, then blanked. |
 | **Status** | Whether a key is available and where it is read from. |
 

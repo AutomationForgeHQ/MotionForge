@@ -82,6 +82,9 @@ void FMotionForgeEditorModule::StartupModule()
 		.SetTooltipText(LOCTEXT("LibraryTabTip",
 			"Every motion definition in the project, what state each is in, and what it produced."))
 		.SetIcon(FSlateIcon(FAppStyle::GetAppStyleSetName(), "ClassIcon.AnimSequence"))
+		// Hidden from the auto-populated Tools list: the family's "Automation Forge" section is the
+		// one entry.
+		.SetMenuType(ETabSpawnerMenuType::Hidden)
 		.SetGroup(WorkspaceMenu::GetMenuStructure().GetToolsCategory());
 }
 

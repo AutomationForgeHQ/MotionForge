@@ -1,16 +1,4 @@
 {
-	"_comment": "What this plugin needs from the machine rather than from a project. Read by the Automation Forge hub, which is a separate process and cannot ask the plugin anything. Keys are metadata only - the operations stay in the plugin, over its own store - and the vault entry is what makes the two surfaces address one row rather than two.",
-
-	"keys": [
-		{
-			"id": "MotionForge.Uthana",
-			"displayName": "Uthana",
-			"owner": "MotionForge",
-			"purpose": "Motion generation through Uthana. Without it this provider cannot be used.",
-			"optional": false,
-			"helpUrl": "https://www.uthana.com",
-			"vaultEntry": "MotionForge/Uthana",
-			"environmentVariable": "MOTIONFORGE_UTHANA_KEY"
-		}
-	]
+	"_comment": "What this plugin needs from the machine rather than from a project. Read by the Automation Forge hub. Empty on purpose: the core spends nothing. Keys belong to the provider plugins that spend them - the Uthana key is declared by MotionForgeUthana, Kimodo's by MotionForgeKimodo.",
+	"keys": []
 }

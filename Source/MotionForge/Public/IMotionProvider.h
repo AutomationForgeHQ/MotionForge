@@ -170,6 +170,19 @@ public:
 	virtual FString GetDisplayName() const = 0;
 
 	/**
+	 * Which plugin this provider ships in, for the shared Keys page.
+	 *
+	 * Not MotionForge, for anything that actually has a key: the registration lives in the core,
+	 * because that is where providers announce themselves - so without this every key would be
+	 * attributed to MotionForge, which is a core and spends nothing. Somebody uninstalling the
+	 * plugin that owns a key would go looking for the wrong one.
+	 *
+	 * Defaults to MotionForge so a provider that forgets is merely unhelpful rather than wrong: a
+	 * provider compiled into the core genuinely would belong to it.
+	 */
+	virtual FText GetOwningPluginName() const { return NSLOCTEXT("MotionForge", "OwnerCore", "MotionForge"); }
+
+	/**
 	 * What this provider can do, so nothing above has to special-case it by name.
 	 *
 	 * Deliberately not optional. Every field here was once an assumption baked into the pipeline for

@@ -114,7 +114,8 @@ void UMotionDef::ApplyProjectDefaults()
 
 	if (ProviderId.IsNone())
 	{
-		ProviderId = Settings->DefaultProviderId;
+		FMotionForgeModule* Module = FMotionForgeModule::GetPtr();
+		ProviderId = Module ? Module->ResolveDefaultProviderId() : NAME_None;
 	}
 
 	// Only inherit the configured model when this definition is actually going to the provider that
@@ -123,7 +124,7 @@ void UMotionDef::ApplyProjectDefaults()
 	// with a name the local model has never heard of.
 	//
 	// Left empty, the provider's own default applies at submit time, which is always right.
-	if (ModelId.IsEmpty() && ProviderId == Settings->DefaultProviderId)
+	if (ModelId.IsEmpty() && !Settings->DefaultProviderId.IsNone() && ProviderId == Settings->DefaultProviderId)
 	{
 		ModelId = Settings->DefaultModelId;
 	}
