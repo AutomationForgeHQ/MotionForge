@@ -7,9 +7,9 @@ imported onto the skeleton you chose.
 pair a character once  →  submit  →  poll  →  review  →  download  →  import
 ```
 
-**Status: 0.2 — verified end to end against a live Uthana account on 2026-08-04.** A written prompt
+**Status: 0.3 — verified end to end against a live Uthana account on 2026-08-04.** A written prompt
 produced a correct 4-second `UAnimSequence` on this project's own skeleton, checked by eye against
-Uthana's web viewer.
+Uthana's web viewer. Later versions build on this verification.
 
 ---
 
@@ -21,10 +21,10 @@ stamp animation curves, place notifies, set up IK, or know anything about any ga
 Those are conventions belonging to whatever consumes the animation, and baking them in would tie this
 plugin to one project's way of working.
 
-**[MontageForge](../MontageForge/README.md) is the next link in the chain** — it turns these sequences
+**[MontageForge](https://github.com/AutomationForgeHQ/MontageForge) is the next link in the chain** — it turns these sequences
 into montages with notifies, layering curves and blends. Written as a sibling rather than folded in,
 for the same reason: it needs GameplayAbilities, and MotionForge needs nothing but the engine. See
-[EXTENSION_PLAN.md](EXTENSION_PLAN.md) for how that split was decided.
+EXTENSION_PLAN.md for how that split was decided.
 
 ---
 
@@ -34,7 +34,7 @@ One pipeline, several generators, chosen **per motion definition** rather than p
 
 | Provider | | |
 |---|---|---|
-| **[Kimodo](../MotionForgeKimodo/README.md)** | free, local, seeded, seconds per take | blocking out a library, iterating on wording |
+| **[Kimodo](https://kovati.dev/plugins/motionforge/)** | free, local, seeded, seconds per take | blocking out a library, iterating on wording |
 | **Uthana** | paid, your own rig, fingers included | the clips that ship |
 
 Block out thirty motions on Kimodo for nothing, then flip the ten that survive to Uthana and
@@ -63,7 +63,7 @@ startup. MotionForge never learns it exists, and deleting it changes nothing.
 
 ## The one thing to understand
 
-Applies to providers that accept a character. [Kimodo](../MotionForgeKimodo/README.md) does not —
+Applies to providers that accept a character. [Kimodo](https://kovati.dev/plugins/motionforge/) does not —
 it generates on its own fixed rig and the clip is mapped onto your skeleton during import, so a
 Motion Character there needs only a `TargetSkeleton`.
 
@@ -284,7 +284,7 @@ sections is exactly editing `BeatSeconds = [2, 7, 3]`. It binds a character on t
 skeleton at the same time, and points the definition's `Control → Constraint Sequence` at it.
 
 **One sequence, both jobs.** It is deliberately the same field and the same asset that carries the
-[constraint poses](../MotionForgeKimodo/README.md#authoring-a-whole-clip-from-a-level-sequence).
+[constraint poses](https://kovati.dev/plugins/motionforge/).
 Constraint keys index the whole timeline and prompt beats divide it, so the two sit alongside each
 other and need no translation between them — a lucky alignment rather than a design, and worth
 knowing because it means posing the character and timing the words happen in one window.
@@ -493,7 +493,7 @@ facing +X, and set it for one that does not.
 
 Get it wrong and every joint sits at exactly the right height while the whole character points a
 quarter turn away from every other animation on that skeleton — see
-[MotionForgeKimodo](../MotionForgeKimodo/README.md#what-is-verified-and-what-is-not) for how long
+[MotionForgeKimodo](https://kovati.dev/plugins/motionforge/) for how long
 that can hide. `FKimodoRigFactory::MeasureFacingYaw` measures it from a rest pose's heel-to-toe
 vectors rather than assuming.
 
@@ -517,7 +517,7 @@ own skeleton resting exactly as it was authored.
 
 Every operation is on the editor subsystem, so it is reachable from C++, Blueprint, Python — and
 therefore from an agent through the companion
-[MotionForgeToolset](../MotionForgeToolset/README.md) plugin.
+[MotionForgeToolset](https://github.com/AutomationForgeHQ/MotionForgeToolset) plugin.
 
 ```python
 import unreal, json
@@ -646,7 +646,7 @@ Verified against a live account on 2026-08-04:
 - download at `fps=60&no_mesh=true`
 - import onto the project skeleton — 3.98s / 240 keys, matching the provider's viewer
 - the result driving a montage, an ability and a gameplay effect in game, via
-  [MontageForge](../MontageForge/README.md)
+  [MontageForge](https://github.com/AutomationForgeHQ/MontageForge)
 
 Verified on 2026-08-15, against Kimodo:
 
@@ -699,7 +699,7 @@ Verified on 2026-08-07:
   to 0.1cm
 - **`FMotionAnimBuilder`**, the direct rotation retarget, including `ForwardYawDegrees`
 - **the Kimodo provider** — see
-  [MotionForgeKimodo](../MotionForgeKimodo/README.md#what-is-verified-and-what-is-not)
+  [MotionForgeKimodo](https://kovati.dev/plugins/motionforge/)
 
 Not exercised:
 
@@ -744,10 +744,11 @@ lives in `MotionForge` and works with `MotionForgeEditor` absent: building a seq
 beats, generating from them and baking them back are plain `UMovieScene` data, driven over MCP with no
 UI in the picture. The editor module is the dragging.
 
-**No menus, no panels, no toolbar buttons** — only what the track itself needs to exist in Sequencer.
-Human UI for these plugins starts from UX flows rather than from controls appearing next to features;
-see [AUTOMATION_FORGE_SHELL_PLAN.md](../../AUTOMATION_FORGE_SHELL_PLAN.md), which is on hold for that
-discussion.
+**The prompt track adds no menus, panels or toolbar buttons of its own** — only what the track
+itself needs to exist in Sequencer. That is a statement about this track, not about the plugin: the
+Motion Library panel, its Tools menu entry and the definition toolkit are all documented above. The
+wider question of how much human UI these plugins should grow is on hold, and is answered from UX
+flows rather than by adding a control next to each feature.
 
 `FMotionForgeModule` holds the provider registry, so an add-on plugin registers itself at module
 startup and this plugin never learns its name.

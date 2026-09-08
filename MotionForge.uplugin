@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
   "Version": 4,
-  "VersionName": "0.3.0",
+  "VersionName": "0.3.1",
   "FriendlyName": "MotionForge",
-  "Description": "Describe a motion, generate it with an AI motion provider, and get a game-ready animation sequence imported onto the skeleton you chose. Owns one pipeline end to end - submit, poll, review, download, normalise in Blender, import. Standalone: no gameplay framework dependency, no montages, no curves, no notifies. Those belong to adapters built on top.",
+  "Description": "Describe a motion, generate it with an AI motion provider, and get a game-ready animation sequence imported onto the skeleton you chose. Owns one pipeline end to end - submit, poll, review, download, import (an optional Blender normalisation pass exists but is off by default). Standalone: no gameplay framework dependency, no montages, no curves, no notifies. Those belong to adapters built on top.",
   "Category": "Automation Forge",
   "CreatedBy": "Bojan Andrejek",
   "CreatedByURL": "https://kovati.dev",
