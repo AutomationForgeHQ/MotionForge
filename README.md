@@ -7,7 +7,9 @@ imported onto the skeleton you chose.
 pair a character once  →  submit  →  poll  →  review  →  download  →  import
 ```
 
-**Status: 0.3 — verified end to end against a live Uthana account on 2026-08-04.** A written prompt
+<!-- forge:version -->**Version 0.4.0. Beta.**<!-- /forge:version -->
+
+**First verified end to end in 0.3, against a live Uthana account on 2026-08-04.** A written prompt
 produced a correct 4-second `UAnimSequence` on this project's own skeleton, checked by eye against
 Uthana's web viewer. Later versions build on this verification.
 
@@ -763,7 +765,6 @@ Source/MotionForge/
                                   output paths, import and retargeting
   MotionCredentialStore.*         OS credential vault
   IMotionProvider.h               provider contract: capabilities, billing, setup steps
-  MotionPipeline.*                a provider's own settings on a definition, one set per provider
   MotionControl.h                 beats, poses and kinematic constraints; the old sampler fields,
                                   kept to migrate definitions saved before providers had settings
   MovieSceneMotionPromptTrack.*   the track whose sections are beats, and the section
