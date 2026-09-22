@@ -53,78 +53,48 @@ public:
 	UFUNCTION()
 	static TArray<FString> GetProviderOptions();
 
+	// Billing, the model id and the unattended mode used to live here. Billing was Uthana's plan applied
+	// to every metered provider (a rented Kimodo pod was priced per generated second); it is each
+	// provider's own now. A model id is a provider's private vocabulary; each provider owns its
+	// default. And a mode that turned every Generate button into an unattended purchase from a page
+	// nobody looks at was a trap - agents and pipelines ask for Automatic by name instead.
+	// Orphaned ini lines for the removed keys are harmless.
+
 	/**
-	 * Which provider new motion definitions use when they do not name one.
-	 *
-	 * Every other provider field falls back to this, so it is the one that decides what an
-	 * unconfigured definition or character actually talks to.
+	 * The provider new motion definitions use. Definitions that name none follow it, and the
+	 * definition window says so. When only one provider is installed, it is the default.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Provider",
 		meta = (GetOptions = "GetProviderOptions"))
 	FName DefaultProviderId = NAME_None;
 
 	/**
-	 * Model new definitions use when they do not name one.
-	 *
-	 * Empty on purpose: a model id is a provider's private vocabulary, so a core that ships no
-	 * provider has no business naming one. Left empty, the provider's own default applies at
-	 * submit time, which is always right.
+	 * A character new definitions get, when it suits their provider. A definition on a provider this
+	 * character is not prepared for gets one that is, or asks for one.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Provider")
-	FString DefaultModelId;
-
-	/** Character new definitions use when they do not name one. */
 	UPROPERTY(config, EditAnywhere, Category = "Provider")
 	TSoftObjectPtr<UMotionCharacter> DefaultCharacter;
 
-	/**
-	 * What this account is billed on. Set it to match the plan, because the two invert the workflow.
-	 *
-	 * Pay-as-you-go bills every generated second, kept or discarded, and downloads are free - so ask
-	 * for few variants and download all of them. A subscription bills downloads instead and
-	 * generation is free - so generate generously and download only the keeper.
-	 *
-	 * Nothing can detect this; only the account knows.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Provider")
-	EMotionBillingModel BillingModel = EMotionBillingModel::PayPerGeneratedSecond;
-
-	/**
-	 * What one billed second costs, for turning estimates into money.
-	 *
-	 * Zero means estimates report seconds only. Uthana's text-to-motion-3.0 is $0.10 per generated
-	 * second on pay-as-you-go.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Provider", meta = (ClampMin = 0.0))
-	float RatePerBilledSecond = 0.f;
-
-	/** Purely for display alongside an estimate. */
-	UPROPERTY(config, EditAnywhere, Category = "Provider")
-	FString Currency = TEXT("USD");
-
-	/** Seconds between job status polls. Providers document a recommended floor - respect it. */
+	/** Seconds between asking a provider how its jobs are doing. */
 	UPROPERTY(config, EditAnywhere, Category = "Provider", meta = (ClampMin = 1, ClampMax = 120, Units = "Seconds"))
 	int32 PollIntervalSeconds = 5;
 
-	/** Give up on a job after this long. Stops a stuck batch polling forever. */
+	/**
+	 * After this long a job is marked late and asked about less often. It is not given up on: the
+	 * provider may still finish it, and a paid one bills it either way. Cancel stops the waiting.
+	 */
 	UPROPERTY(config, EditAnywhere, Category = "Provider", meta = (ClampMin = 30, Units = "Seconds"))
 	int32 JobTimeoutSeconds = 900;
 
 	// ---------------------------------------------------------------------------------------------
-	// Pipeline
+	// Output
 	// ---------------------------------------------------------------------------------------------
 
 	/**
-	 * How far a batch runs unattended.
-	 *
-	 * Human-in-the-loop is the default because generation is typically free while downloads are
-	 * metered - stopping to choose is what keeps the bill down.
+	 * The content folder everything is created under: definitions, takes, characters, rigs, prompt
+	 * timelines and montages, each in its own subfolder. Must be under a mounted root such as /Game.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Pipeline")
-	EMotionPipelineMode DefaultMode = EMotionPipelineMode::HumanInTheLoop;
-
-	/** Content path new definitions and imported animations are created under. */
-	UPROPERTY(config, EditAnywhere, Category = "Pipeline")
+	UPROPERTY(config, EditAnywhere, Category = "Output")
 	FString OutputContentPath = TEXT("/Game/_Generated/Motion");
 
 	// Sorted by kind, at the point of generation.
@@ -176,76 +146,47 @@ public:
 	 */
 	static FMotionOutputPaths SetOutputRoot(const FString& ContentPath);
 
-	/**
-	 * Where downloaded files land before import, relative to the project directory.
-	 *
-	 * Raw downloads are kept rather than deleted: on providers with no seed a generation cannot be
-	 * reproduced, so the file on disk is the only copy that will ever exist.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Pipeline")
+	// Raw downloads are kept: on a provider with no seed the file is the only copy there will ever be.
+	/** Where fetched takes are kept on disk, relative to the project. Keep them: a take without a seed cannot be made again. */
+	UPROPERTY(config, EditAnywhere, Category = "Output")
 	FString StagingDirectory = TEXT("Saved/MotionForge");
 
-	/**
-	 * Frame rate requested from the provider, and the rate clips are sampled at on import.
-	 *
-	 * Match the provider's native rate. Uthana generates at 60, and asking it for less **re-times
-	 * rather than resamples** - a four second clip fetched at 30 arrives as an 8.3 second one,
-	 * imports without complaint, and is simply wrong. Nothing in the response says so; the only
-	 * symptom is a duration that disagrees with the provider's own viewer.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Pipeline", meta = (ClampMin = 1, ClampMax = 240))
-	int32 TargetFrameRate = 60;
-
 	// ---------------------------------------------------------------------------------------------
-	// Blender
+	// Import
 	// ---------------------------------------------------------------------------------------------
 
-	/**
-	 * Run downloaded clips through a Blender round trip before importing. **Off, deliberately.**
-	 *
-	 * A Blender FBX round trip reorients the rig: the importer rebuilds bone orientations and the
-	 * exporter applies an axis conversion, so a clip that was upright arrives rotated and twisted -
-	 * and ten frames longer, because the re-export re-times it. Every bone still matches by name and
-	 * nothing warns, which makes it look like a rig mismatch and sends you hunting in the wrong
-	 * place. It has now cost most of a day twice.
-	 *
-	 * Importing the provider's file untouched, onto the provider's own skeleton, is correct. This
-	 * stays off until the axis handling in `normalize_motion.py` is solved and verified against the
-	 * provider's web viewer.
-	 *
-	 * **This is a separate switch from the executable path on purpose.** Normalisation used to be
-	 * "off" only because nobody had set a Blender path, which is not a decision - it is a fact about
-	 * one computer. Opening the project on a machine that happens to have Blender installed silently
-	 * turned it back on, and every clip imported afterwards was rotated: same file, same code,
-	 * different desk. A capability being *available* must never be the same fact as it being *wanted*.
-	 *
-	 * What is given up meanwhile: trimming, and stripping root translation. Uthana can do the second
-	 * itself with `in_place` on the download, which is free and lossless - prefer that.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Blender")
-	bool bNormalizeImportedClips = false;
-
-	/**
-	 * Blender executable, for whatever needs one.
-	 *
-	 * Safe to fill in and worth keeping filled in: on its own it does nothing, because the round trip
-	 * is gated by `bNormalizeImportedClips` above. Another provider may need a Blender step that does
-	 * not have this one's axis problem, and it should not have to re-answer "where is Blender".
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Blender", meta = (FilePathFilter = "exe"))
-	FFilePath BlenderExecutable;
-
-	/** Seconds to allow one normalisation before killing it. */
-	UPROPERTY(config, EditAnywhere, Category = "Blender", meta = (ClampMin = 10, Units = "Seconds"))
-	int32 BlenderTimeoutSeconds = 120;
-
-	/** Strip root translation so clips play in place. Turn off for motion that should travel. */
-	UPROPERTY(config, EditAnywhere, Category = "Blender")
+	// Lived under Blender for a long time while also deciding every Kimodo import. It is an import
+	// setting for every provider.
+	/** Remove the root's travel so clips play on the spot. Turn off for motion that should move through the world, such as a walk to a mark. */
+	UPROPERTY(config, EditAnywhere, Category = "Import")
 	bool bZeroRootTranslation = true;
 
 	/** Add a root bone when the provider's rig has none, so the engine can drive root motion later. */
-	UPROPERTY(config, EditAnywhere, Category = "Blender")
+	UPROPERTY(config, EditAnywhere, Category = "Import")
 	bool bEnsureRootBone = true;
+
+	// ---------------------------------------------------------------------------------------------
+	// Legacy: Blender normalisation
+	// ---------------------------------------------------------------------------------------------
+
+	// Off, deliberately. A Blender FBX round trip reorients the rig and re-times the clip, and every
+	// bone still matches by name, so it looks like a rig mismatch; it has cost most of a day twice. It
+	// is a separate switch from the executable path because a capability being available must never
+	// be the same fact as it being wanted - a machine that happened to have Blender once turned it on.
+	/**
+	 * Run fetched FBX clips through Blender before import. Off: the round trip rotates and re-times
+	 * clips, and stays off until that is solved. Leave it off.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Legacy: Blender normalisation")
+	bool bNormalizeImportedClips = false;
+
+	/** Blender, for anything that needs it. Setting it turns nothing on by itself. */
+	UPROPERTY(config, EditAnywhere, Category = "Legacy: Blender normalisation", meta = (FilePathFilter = "exe"))
+	FFilePath BlenderExecutable;
+
+	/** Seconds to allow one normalisation before stopping it. */
+	UPROPERTY(config, EditAnywhere, Category = "Legacy: Blender normalisation", meta = (ClampMin = 10, Units = "Seconds"))
+	int32 BlenderTimeoutSeconds = 120;
 
 	// ---------------------------------------------------------------------------------------------
 	// Queries

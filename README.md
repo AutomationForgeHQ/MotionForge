@@ -11,6 +11,24 @@ pair a character once  →  submit  →  poll  →  review  →  download  →  
 produced a correct 4-second `UAnimSequence` on this project's own skeleton, checked by eye against
 Uthana's web viewer. Later versions build on this verification.
 
+## Start here
+
+**Tools ▸ Automation Forge ▸ MotionForge** opens **Get started**: three steps, each measured rather
+than assumed.
+
+1. **Where motion is made.** Each installed provider with its own setup, row by row — keys, access
+   grants, Docker, the runner — and the button that moves each row on. What it costs, in its own words.
+2. **Who it is for.** A Motion Character prepared for that provider, or one made in a moment from any
+   skeletal mesh with *New from a mesh*. The provider's own steps for it (upload it, build a rig) sit
+   beside it.
+3. **What happens.** A prompt, with examples to start from. *Create and open* makes the definition and
+   opens its window, where **Generate** says its price on the button before anything is spent.
+
+Each step is a box that opens and closes like a Details category, with a badge - its number, a tick
+once done, orange when it needs you - and a one-line summary in its header, so a finished step can be
+closed and still say what it holds. The other page of the same tab is the library of every definition.
+`MotionForge.GetStarted` opens it from the console, and an agent opens it with `Open MotionForge Window`.
+
 ---
 
 ## What this is not
@@ -55,6 +73,11 @@ unreal.get_editor_subsystem(unreal.MotionForgeSubsystem).get_provider_caps("Kimo
 | `bNeedsCredential` | a local provider has nothing to sign in to |
 | `bSupportsConstraints`, `bSupportsPromptRewrite` | ignored rather than refused where absent |
 | `SetupHint` | what a human has to do before this provider works at all |
+| `PrepareLabel` | not ready, but it can get itself ready - Generate starts a stopped runner rather than refusing |
+| `Billing` | what it charges for, in its own unit: free, per generated second, per downloaded second, per hour |
+| `Models` | the models it offers and the lengths each accepts |
+| `PipelineClass` | its own settings class, so its options can be listed and set by name |
+| `ConstraintTypes` | the poses it honours; empty means it takes none, and pose tools are not offered |
 
 Adding a provider is a new plugin that calls `FMotionForgeModule::RegisterProvider` at module
 startup. MotionForge never learns it exists, and deleting it changes nothing.
@@ -84,72 +107,62 @@ characters, say — where the rigs genuinely differ. See [Retargeting](#retarget
 
 ## Setup
 
-### 1. API key
+### 1. Keys
 
-**Project Settings → Plugins → MotionForge → Credentials.**
+Get started shows every key each provider needs, measured, with **Add** or **Replace** beside it. Those
+open the **Keys page** (*Tools ▸ Automation Forge ▸ Keys*), which the Automation Forge hub also reads -
+set a key in either and both see it.
 
-| Field | |
+| Provider | Needs |
 |---|---|
-| **Credential Provider Id** | Which provider the fields below act on. Empty means whichever provider is the default. |
-| **API Key** | Paste and commit. Stored immediately, then blanked. |
-| **Status** | Whether a key is available and where it is read from. |
+| Uthana | an API key |
+| Kimodo, on this machine | a Hugging Face read token **with access granted to Llama 3** - a token alone installs fine and fails every generation later, so Get started and the Kimodo Runner panel ask Hugging Face and say which |
+| Kimodo, on a rented GPU | the same token, plus a Runpod key with write access |
+| Kimodo, on another machine | a runner token, if that runner was started with one |
 
-Acting on the key happens from the **console**, not the settings page:
+Keys go into the **OS credential vault** (Windows Credential Manager - `MotionForge/Uthana` for the
+Uthana key), never into a project file, so copying, committing or zipping the project cannot carry one.
+**`MOTIONFORGE_UTHANA_KEY` overrides the vault when set**, for CI and headless runs.
+
+**Do not write the vault entry with `cmdkey` or the Credential Manager GUI.** The blob is stored as
+UTF-8; Windows' own tools write UTF-16LE, so a key set that way reads back garbled and fails
+authentication while looking correct.
+
+From the console, each taking an optional provider id:
 
 ```
 MotionForge.TestConnection      one cheap authenticated call; result under LogMotionForge
-MotionForge.CredentialStatus    re-read Status, e.g. after setting an environment variable
+MotionForge.CredentialStatus    whether a key is available, and where it is read from
 MotionForge.ClearKey            forget the stored key
 ```
 
-Each takes an optional provider id, defaulting to the one in settings.
+### 2. Billing belongs to the provider
 
-> **Why not buttons?** `UFUNCTION(CallInEditor)` does not render on a `UDeveloperSettings` page.
-> `FObjectDetails::AddCallInEditorMethods` discards objects flagged `RF_ArchetypeObject` before
-> deciding whether to draw them, and a settings panel edits the CDO, which is one. Real buttons need
-> an `IDetailCustomization`; until that exists the console is the honest surface rather than a
-> control that silently does nothing.
+Each provider says what it charges for, and every price in the editor comes from that: the Generate
+button, the library's footer, the timeline's Generate, `Preview Motion Request`.
 
-The key goes into the **OS credential vault** (Windows Credential Manager, under
-`MotionForge/Uthana`), never into a project file. The settings property holding it is `Transient` and
-carries no `config` specifier, so it cannot reach an ini; it is cleared the moment it is handed to the
-vault and cannot be read back out through the panel. Copying the project, committing it, or zipping it
-cannot carry the key, because it was never inside the project directory.
-
-**`MOTIONFORGE_UTHANA_KEY` overrides the vault when set**, for CI and headless runs. Note the
-precedence: clearing the vault while that variable is set changes nothing, and the log says so rather
-than letting Status contradict the action.
-
-**Do not write the vault entry with `cmdkey` or the Credential Manager GUI.** This plugin stores the
-blob as UTF-8; Windows' own tools write UTF-16LE, so a key set that way reads back garbled and fails
-authentication while looking correct.
-
-### 2. Billing model — set this before generating anything
-
-The two plans invert the correct workflow, and getting it backwards costs real money.
-
-| | Bills on | So you should |
+| Provider | Bills on | Where it is set |
 |---|---|---|
-| **Pay as you go** | **generated** seconds, kept or discarded | ask for few variants; downloads are free, so fetch them all |
-| **Subscription** | **downloaded** seconds; generation unlimited | generate generously, review, download only the keeper |
+| Kimodo, local | nothing | - |
+| Kimodo, rented GPU | the hour, while the pod is up, generating or not | the Kimodo Runner panel shows the rate before renting |
+| Uthana, pay as you go | **generated** seconds, kept or discarded ($0.10 a second on `text-to-motion-3.0`) | *Project Settings ▸ Automation Forge ▸ MotionForge Uthana* |
+| Uthana, subscription | **downloaded** seconds; generation unlimited | the same page |
 
-Set `Billing Model` to match the account, and `Rate Per Billed Second` to turn estimates into money
-(Uthana's `text-to-motion-3.0` is $0.10 per generated second on PAYG). Nothing can detect this; only
-the account knows.
+The two Uthana plans invert the right workflow. On pay as you go the money is spent at submission, so
+ask for few takes and watch them all - fetching one to look at is free. On a subscription, generate
+generously and import only the keeper. Nothing can detect the plan; only the account knows, so set it.
+Settings from before this page existed are carried over automatically.
 
-On PAYG, **reviewing before downloading saves nothing** — the money was spent at submission. Review
-to pick the best take, not to control cost.
+**Anything that bills asks first.** Generate, Import and the timeline's Generate all name the price in
+a confirmation when it is more than nothing.
 
-### 3. Frame rate — you no longer set this
+### 3. Frame rate — not a setting
 
-**`Target Frame Rate` in settings is now only a fallback.** The rate comes from the provider's
-capabilities: 60 for Uthana, 30 for Kimodo.
+The rate comes from the provider: 60 for Uthana, 30 for Kimodo. There is no project setting for it.
 
-It had to move. A global setting is correct for exactly one provider and silently wrong for every
-other, and a wrong frame rate is the worst kind of bug here — Uthana, asked for less than its native
-rate, **re-times rather than resamples**, so a 4-second clip requested at `fps=30` arrives as an
-8.3-second file. It imports without a single warning, logs cleanly, and is simply wrong: long,
-mushy, and easily mistaken for a padded prompt or a billing error.
+A global rate is correct for exactly one provider and silently wrong for every other. Uthana, asked
+for less than its native rate, **re-times rather than resamples**, so a 4-second clip requested at
+`fps=30` arrives as an 8.3-second file that imports without a single warning.
 
 ### 4. Blender — leave it empty
 
@@ -177,7 +190,8 @@ Create a **Motion Character** asset:
 | `TargetSkeleton` | The skeleton finished animations end up on. |
 | `PreviewMesh` | The mesh to upload, on that skeleton. This defines the rig the provider generates against. |
 
-Then pair it — `ProviderCharacterId` is filled in for you:
+Then pair it — from the character's window (*With Uthana ▸ Upload*), from Get started, or from the
+console. `ProviderCharacterId` is filled in for you:
 
 ```
 MotionForge.UploadCharacter /Game/_Generated/Motion/MC_MyCharacter
@@ -438,26 +452,28 @@ Insurance, not a step in the workflow. It copies the beats back onto the definit
 same sequence usually carries the constraint poses, so clearing it to bake a prompt would be a poor
 trade. What it buys is that deleting the sequence later costs nothing.
 
-### The two modes
+### Review, always
 
-**Human in the loop** (default) — generate, then stop so someone can look at the takes:
+Every Generate a person presses stops for review - in the definition's window, in the library and on
+the prompt timeline:
 
 ```
-Generate → poll → AwaitingReview → SelectCandidate → DownloadSelected → import → Ready
+Generate → takes arrive → watch them on the character → Choose and import → Ready
 ```
 
-Every candidate carries a `ViewerUrl`, so takes can be watched in the provider's own player for free
-before choosing.
+The window's stage plays any take on the character it is for **before** it is chosen: fetched where
+that is free, built into a transient clip, never saved - and by the route its import takes, so a
+character with a provider rig sees the take built on that rig and retargeted with its own retargeter. *Show as B* puts a second take beside it on the
+same clock. On an Uthana subscription, where fetching bills, the provider's own viewer is the free way
+to look.
 
-**Automatic** — `RunFullPipeline`, unattended. Generates, takes the first usable variant, downloads
-and imports without stopping.
+**Automatic** - generate, take the first usable take, import, unattended - stays for pipelines and
+agents, as `RunFullPipeline`. It is not on any button: a setting that turns every button into an
+unattended purchase is the one thing a person cannot see coming.
 
-Which is cheaper depends entirely on the billing model above. On a subscription, review saves
-downloads and therefore money. On pay-as-you-go it saves nothing, because generation already billed —
-so Automatic is the efficient choice there, not the reckless one.
-
-Only the chosen take is downloaded. The others are not thrown away: their motion ids are on the asset
-and the provider still holds them, so any can be fetched later.
+Only the chosen take is imported, into one clip per definition (`AS_<Definition>`), replaced after a
+confirmation that names what uses it. The others are kept: their records are on the asset, and hidden
+rather than deleted, because a take without a seed cannot be made again.
 
 ---
 
@@ -638,6 +654,26 @@ combination accounted for most of the time spent getting this working.
 
 ## What is verified, and what is not
 
+Verified on 2026-09-18, the provider settings and the new windows, against a stand-in Kimodo runner
+that speaks the real routes, refuses what the real runner refuses and replays real takes from disk:
+
+- **a first motion end to end through the calls the windows make**: create, preview the request, two
+  takes generated, stopped for review, one chosen and imported onto Quinn through the Kimodo rig
+- **each take's seed on the wire is the seed on its record**, alongside provider, model and length
+- **pinned poses reach the runner**: a pose from `MM_Pistol_Idle` pinned at the start and the end
+  arrived as one full-body constraint with keys at frames 0 and 119, and the runner accepted them
+- a take made before a pose was added reads as an **older recipe**; one made after does not
+- **the clip in the game stays recorded as in the game** while new takes wait for review
+- the download estimate says *fetching 8 s from Kimodo (local): free*
+- **the stage plays a take before it is chosen**, built from the file on disk onto the character's own
+  skeleton, including a take whose recorded path pointed at another definition's staging file
+- the resave of 75 definitions into provider settings, spot-checked for status, takes, the imported
+  take and each provider's options
+
+Not exercised on this version: a generation on the live Kimodo GPU runner, a paid Uthana generation,
+and the buttons on Get started, the Kimodo Runner panel's *Another machine* page and the character
+window, which are Slate and were read rather than clicked.
+
 Verified against a live account on 2026-08-04:
 
 - basic auth (key as username, empty password), connection test
@@ -723,18 +759,29 @@ Source/MotionForge/
   MotionForgeSubsystem.*          the public API - everything goes through here
   MotionDef.*                     one motion: prompt, candidates, result
   MotionCharacter.*               provider character id ↔ target skeleton ↔ optional retarget
-  MotionForgeSettings.*           Project Settings page, billing model, fallback frame rate
+  MotionForgeSettings.*           Project Settings page: default provider, polling and timeout,
+                                  output paths, import and retargeting
   MotionCredentialStore.*         OS credential vault
-  IMotionProvider.h               provider contract, and the capabilities every one declares
-  MotionControl.h                 seed, sampler settings, kinematic constraints
+  IMotionProvider.h               provider contract: capabilities, billing, setup steps
+  MotionPipeline.*                a provider's own settings on a definition, one set per provider
+  MotionControl.h                 beats, poses and kinematic constraints; the old sampler fields,
+                                  kept to migrate definitions saved before providers had settings
   MovieSceneMotionPromptTrack.*   the track whose sections are beats, and the section
   MotionPromptSequence.*          building one from a definition, and reading it back
   MotionTakeProvenance.*          what made this clip, written onto the clip
-  Providers/UthanaProvider.*      first implementation
   MotionNormalizeTask.*           Blender invocation
   MotionImporter.*                FBX → UAnimSequence, and → USkeletalMesh for provider rigs
   MotionAnimBuilder.*             rotations on a foreign rig → UAnimSequence on ours, no file format
-Source/MotionForgeEditor/         Sequencer's affordance for the prompt track - nothing else
+  MotionPipeline.*                the base of each provider's own settings class
+Source/MotionForgeEditor/         every window, and Sequencer's affordance for the prompt track
+  SMotionHome.*                   the MotionForge tab: Get started and the library
+  SMotionGetStarted.*             providers, a character, a first prompt
+  SMotionLibrary.*                every definition, priced as a selection
+  MotionDefEditorToolkit.*        the definition window: Takes and Record left, Generate and Settings right
+  SMotionTakesPanel.*             the take list, and the stage that plays a take before it is chosen
+  SMotionStage.*                  the preview viewport: two bodies, one clock
+  SMotionGeneratePanel.*          prompt, character, provider settings, the priced Generate, Direct
+  MotionCharacterDetails.*        the character window: facts, then each provider's own actions
   MotionPromptTrackEditor.*       so a beat can be seen, dragged and added
 ```
 
@@ -757,73 +804,51 @@ startup and this plugin never learns its name.
 
 ## The editor surface
 
-Added 2026-08-29. Everything here is a thin layer over `UMotionForgeSubsystem`,
-so an agent reaches all of it too — that is rule 5, and it has no exceptions.
+Everything here is a thin layer over `UMotionForgeSubsystem`, so an agent reaches all of it too.
 
-**A Motion Definition opens into a window.** The prompt first and large, because
-the prompt is the work; the provider a list of what is actually installed;
-length, variants and character as pickers; the whole `Control` tree behind
-*Advanced*. On the right, the takes: status in a sentence, what a generation
-would cost before it is spent, and a card per take carrying the motion id — the
-only route back to a take on a provider that cannot reproduce one — and a single
-*Choose*. Generate, Import, Prompt Timeline and Show Animation are on the
-toolbar.
+**The MotionForge tab.** *Tools ▸ Automation Forge ▸ MotionForge*. Two pages: **Get started** (above)
+and the **library** - every definition on one list with its state, the provider it will actually use,
+its takes, the animation it produced and its prompt. Filters carry their own counts; search names and
+prompts; double-click to open. A selection is priced before it is spent, each definition on its own
+provider, and Generate and Import ask before anything bills. A definition claiming *Ready* whose clip
+was deleted says so in red. The tab opens on Get started until the project has a motion to show.
 
-**Generate is offered only when it would work.** `CheckReadiness` asks the same
-six questions submission asks — provider, credential, provider ready, character,
-character usable, prompt — so the button greys out with the reason in its
-tooltip instead of failing after the click. A missing key gets a button to the
-Keys page.
+**A Motion Definition opens into a window.** Left, the **Takes**: a stage that plays the chosen take -
+or any other, before choosing it - on the character it is for, and under it a list with every take's
+number, when it was made, the provider and model, its seed, length, cost, and whether it is in the game,
+ready on disk, or made from an older recipe. *Record* is the whole record of the selected take: the
+prompt and settings actually sent. Right, **Generate**, top to bottom:
 
-**A provider that runs on hardware can offer its own setup.** Implement
-`GetSetupSurfaceLabel` and `OpenSetupSurface` on `IMotionProvider` and the
-definition window grows an *Open …* button, leading when the provider says it is
-not ready. MotionForge never learns what the provider is managing; Kimodo's
-answer happens to be a Docker container or a rented GPU.
+- **Prompt**, with examples, the length and each beat's seconds.
+- **Character**, suitable ones first, with the route its clips take and the provider's own steps.
+- **Generate**: the provider, **its own settings** by their own names - seed, steps and guidance for
+  Kimodo, prompt rewriting for Uthana - the number of takes, *What will be sent*, and the button, which
+  says what it will do and cost: "Generate 2 · $1.00", or "Start the Kimodo runner, then generate 1".
+- **Direct**, for a provider that takes poses: how to guide it, and its own actions.
+- **Import**, the settings for bringing a take in.
 
-**Readiness stays current.** `OnProviderStateChanged` covers anything done
-inside the editor, a ten-second `RefreshState` poll covers what it cannot see —
-a container stopped from a terminal, a pod released elsewhere — and there is a
-refresh button because both will still miss something.
+**A provider brings its own settings.** Each registers a settings class; a definition keeps one per
+provider, so switching Kimodo to Uthana and back restores both. Definitions from before this migrate
+when loaded, and `Migrate Motion Definitions` resaves them.
 
-**A Motion Character is a checklist, not ten fields.** Pairing is five steps of
-which four must happen in order, and which of them exist depends on the
-provider: a service that retargets on its own hardware wants a character
-uploaded and an id back; one that generates on a fixed rig wants neither.
+**A Motion Character is a checklist, then each provider's own section.** The facts first - skeleton,
+preview mesh, the pipeline its clips take. Then, per provider it could go to, whether it suits, the
+route, and that provider's actions: build a Kimodo rig, upload to Uthana, fetch Uthana's copy of the
+rig. A provider rig with no retargeter is offered *Import directly*, which is the fix whatever the
+provider.
 
-The one thing worth knowing before reading that page: **`Provider Mesh` is not a
-required field.** Its presence chooses the pipeline — empty imports straight onto
-the target skeleton, set imports onto the provider's rig and retargets. Both are
-finished configurations.
+**`Provider Mesh` is not a required field.** Its presence chooses the pipeline - empty imports straight
+onto the target skeleton, set imports onto the provider's rig and retargets. Both are finished
+configurations.
 
-**The library.** *Tools ▸ Automation Forge ▸ Motion Library*, or
-`MotionForge.Library`. Every definition in the project on one list: its state,
-which provider it will actually use, how many takes it has, the animation it
-produced, and its prompt. Filters carry their own counts. Sort by name, state or
-provider; search names and prompts; double-click to open.
+**Readiness stays current.** `OnProviderStateChanged` covers anything done inside the editor, a poll
+covers what it cannot see - a container stopped from a terminal, a pod released elsewhere.
 
-Two things it does that a folder of icons cannot:
+**Keys reach two surfaces.** `Config/ForgeMachine.json` declares each key - what it is for, where to get
+one, the Credential Manager entry, the environment variable. The editor's Keys page reads it, and so
+does the Automation Forge hub, which can set a key before an editor is open.
 
-- **A selection is priced before it is spent.** Select five definitions and the
-  footer says what generating them would cost, per the providers they each
-  resolve to, before the button is pressed. Generate is offered only for the
-  ones that would actually work, and says so when none would.
-- **It catches a result that is gone.** A definition's status records what the
-  pipeline did and stays true after somebody deletes the clip, so a library can
-  be full of definitions claiming *Ready* with nothing to show. The library asks
-  the asset registry instead of believing the status, and says so in red — as
-  does `GetMotionStatus`, through `bImportedSequenceMissing`.
-
-**Keys reach two surfaces.** `Config/ForgeMachine.json` declares the Uthana key —
-what it is for, where to get one, the Credential Manager entry, the environment
-variable. The editor's Keys page reads it, and so does the Automation Forge hub,
-which is a separate application and can therefore set a key before an editor is
-open. Same vault entry either way.
-
-**Creating either asset.** Right-click in the Content Browser ▸ *Automation
-Forge ▸ MotionForge ▸ Motion Definition* (or *Motion Character*), or **New
-Definition** in the library. Before 0.2.0 there was no factory, so the only
-route was *Miscellaneous ▸ Data Asset* and finding the class in a list of every
-data asset class in the project. Both routes now apply the same project defaults
-through `UMotionDef::ApplyProjectDefaults`, which is what `CreateMotionDef` uses
-— a definition made by hand is not subtly different from one an agent authored.
+**Creating either asset.** *Create and open* on Get started; **New Definition** in the library; or
+right-click in the Content Browser ▸ *Automation Forge ▸ MotionForge*. All of them apply the same project
+defaults as `CreateMotionDef`, so a definition made by hand is not subtly different from one an agent
+authored.

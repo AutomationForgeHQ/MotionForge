@@ -158,7 +158,9 @@ private:
 	void HandleBake(UMovieSceneTrack* Track);
 
 	/**
-	 * Generate from these beats, and drop the result on the animation row below.
+	 * Generate from these beats. The takes stop for review in the definition's window, which opens;
+	 * the one chosen there is imported and dropped on the animation row below. Asks first when it
+	 * would spend money.
 	 *
 	 * Non-blocking, and idempotent underneath - the subsystem refuses a definition already in flight,
 	 * so a second click cannot submit twice. What this has to do is *look* busy, because a control

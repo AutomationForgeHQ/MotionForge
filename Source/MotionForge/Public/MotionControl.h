@@ -42,6 +42,23 @@ enum class EMotionConstraintType : uint8
 	RightFoot	UMETA(DisplayName = "Right Foot")
 };
 
+/** Where a generation's constraint poses are read from. Set by the provider's pipeline. */
+UENUM(BlueprintType)
+enum class EMotionConstraintSource : uint8
+{
+	/** The poses keyed on the prompt timeline when it has any, otherwise the authored list. */
+	Automatic	UMETA(DisplayName = "timeline, else authored"),
+
+	/** Only the poses keyed on the prompt timeline. Nothing when the timeline has none. */
+	Timeline	UMETA(DisplayName = "timeline only"),
+
+	/** Only the authored list. The timeline still supplies the beats. */
+	Authored	UMETA(DisplayName = "authored only"),
+
+	/** No constraints at all: the prompt alone. Handy for comparing with and without. */
+	None		UMETA(DisplayName = "none")
+};
+
 /**
  * A body pose, sampled on whichever skeleton it was authored on.
  *
@@ -439,6 +456,13 @@ struct MOTIONFORGE_API FMotionControl
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Control")
 	EMotionConstraintType ConstraintSequenceType = EMotionConstraintType::FullBody;
 
+	/**
+	 * Which poses are sent: the timeline's, the authored list, or none. Written by the provider's
+	 * pipeline at submission; not stored on a definition.
+	 */
+	UPROPERTY(Transient, BlueprintReadWrite, Category = "Control")
+	EMotionConstraintSource ConstraintSource = EMotionConstraintSource::Automatic;
+
 	/** True when nothing here would change what the provider does. */
 	bool IsDefault() const
 	{
@@ -450,5 +474,27 @@ struct MOTIONFORGE_API FMotionControl
 			&& bSplitPromptIntoBeats
 			&& BeatSeconds.Num() == 0
 			&& Constraints.Num() == 0;
+	}
+
+	/** True when a sampler field - seed, steps, guidance, post-process, splitting - differs from default. */
+	bool HasSamplerSettings() const
+	{
+		return Seed >= 0
+			|| DiffusionSteps != 0
+			|| TextGuidance != 0.f
+			|| ConstraintGuidance != 0.f
+			|| !bPostProcess
+			|| !bSplitPromptIntoBeats;
+	}
+
+	/** How many constraint keys are authored here, across every type. */
+	int32 CountAuthoredKeys() const
+	{
+		int32 Count = 0;
+		for (const FMotionConstraint& Constraint : Constraints)
+		{
+			Count += Constraint.Keys.Num();
+		}
+		return Count;
 	}
 };

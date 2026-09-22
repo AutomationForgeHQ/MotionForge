@@ -823,15 +823,30 @@ FMotionArtifactResult FMotionAnimBuilder::Build(
 	const FString PackageName = Request.DestinationPackagePath / Request.AssetName;
 	const FString ObjectPath = FString::Printf(TEXT("%s.%s"), *PackageName, *Request.AssetName);
 
-	// Reuse rather than duplicate. Regenerating a definition should replace its animation in place,
-	// so everything already referencing it keeps working.
-	UAnimSequence* Sequence = LoadObject<UAnimSequence>(nullptr, *ObjectPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
-	UPackage* Package = Sequence ? Sequence->GetOutermost() : CreatePackage(*PackageName);
+	UAnimSequence* Sequence = nullptr;
+	UPackage* Package = nullptr;
+	bool bCreated = false;
 
-	const bool bCreated = (Sequence == nullptr);
-	if (bCreated)
+	if (Request.bTransient)
 	{
-		Sequence = NewObject<UAnimSequence>(Package, FName(*Request.AssetName), RF_Public | RF_Standalone);
+		// A preview: its own transient package, never loaded from disk, never registered, never saved.
+		// Watching ten takes must not leave ten clips in the project.
+		Package = GetTransientPackage();
+		Sequence = NewObject<UAnimSequence>(Package,
+			MakeUniqueObjectName(Package, UAnimSequence::StaticClass(), FName(*Request.AssetName)), RF_Transient);
+	}
+	else
+	{
+		// Reuse rather than duplicate. Regenerating a definition should replace its animation in place,
+		// so everything already referencing it keeps working.
+		Sequence = LoadObject<UAnimSequence>(nullptr, *ObjectPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
+		Package = Sequence ? Sequence->GetOutermost() : CreatePackage(*PackageName);
+
+		bCreated = (Sequence == nullptr);
+		if (bCreated)
+		{
+			Sequence = NewObject<UAnimSequence>(Package, FName(*Request.AssetName), RF_Public | RF_Standalone);
+		}
 	}
 
 	Sequence->SetSkeleton(Request.TargetSkeleton);
@@ -860,7 +875,26 @@ FMotionArtifactResult FMotionAnimBuilder::Build(
 		//
 		// Only bones that actually differ get a track. Writing a constant curve for all hundred-odd
 		// untracked bones would double the asset to say nothing.
-		if (Request.UntrackedPoseSource)
+		// Only from an animation on this same body. Its bones' local transforms are copied as they are,
+		// and another skeleton's fingers and in-between spine bones have other lengths and other axes:
+		// copied onto a CC5 skeleton, a Narrative idle stretched every finger into a claw and bent the
+		// torso backwards. Those bones keep the reference pose instead, which is at least this body's.
+		const USkeleton* PoseSkeleton = Request.UntrackedPoseSource ? Request.UntrackedPoseSource->GetSkeleton() : nullptr;
+		const bool bPoseFitsBody = PoseSkeleton && Request.TargetSkeleton
+			&& (PoseSkeleton == Request.TargetSkeleton || PoseSkeleton->IsCompatibleForEditor(Request.TargetSkeleton));
+
+		if (Request.UntrackedPoseSource && !bPoseFitsBody)
+		{
+			UE_LOG(LogMotionForge, Log,
+				TEXT("Not posing the bones the generator does not drive from '%s': it is on %s, and this clip is for %s. "
+					 "They keep %s's reference pose."),
+				*Request.UntrackedPoseSource->GetName(),
+				PoseSkeleton ? *PoseSkeleton->GetName() : TEXT("no skeleton"),
+				Request.TargetSkeleton ? *Request.TargetSkeleton->GetName() : TEXT("no skeleton"),
+				Request.TargetSkeleton ? *Request.TargetSkeleton->GetName() : TEXT("the skeleton"));
+		}
+
+		if (Request.UntrackedPoseSource && bPoseFitsBody)
 		{
 			const TMap<FName, FTransform> Pose = MotionUntracked::ReadPose(
 				Request.UntrackedPoseSource, Request.UntrackedPoseTime, Ref);
@@ -927,25 +961,29 @@ FMotionArtifactResult FMotionAnimBuilder::Build(
 	}
 
 	Sequence->PostEditChange();
-	Sequence->MarkPackageDirty();
 
-	if (bCreated)
+	if (!Request.bTransient)
 	{
-		FAssetRegistryModule::AssetCreated(Sequence);
-	}
+		Sequence->MarkPackageDirty();
 
-	FSavePackageArgs SaveArgs;
-	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-	SaveArgs.SaveFlags = SAVE_NoError;
+		if (bCreated)
+		{
+			FAssetRegistryModule::AssetCreated(Sequence);
+		}
 
-	const FString Filename = FPackageName::LongPackageNameToFilename(
-		PackageName, FPackageName::GetAssetPackageExtension());
+		FSavePackageArgs SaveArgs;
+		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+		SaveArgs.SaveFlags = SAVE_NoError;
 
-	if (!UPackage::SavePackage(Package, Sequence, *Filename, SaveArgs))
-	{
-		UE_LOG(LogMotionForge, Warning,
-			TEXT("Built '%s' but could not save it. The asset exists in memory; save it by hand."),
-			*ObjectPath);
+		const FString Filename = FPackageName::LongPackageNameToFilename(
+			PackageName, FPackageName::GetAssetPackageExtension());
+
+		if (!UPackage::SavePackage(Package, Sequence, *Filename, SaveArgs))
+		{
+			UE_LOG(LogMotionForge, Warning,
+				TEXT("Built '%s' but could not save it. The asset exists in memory; save it by hand."),
+				*ObjectPath);
+		}
 	}
 
 	UE_LOG(LogMotionForge, Log,

@@ -10,8 +10,12 @@
 #include "ISequencer.h"
 #include "LevelSequence.h"
 #include "MVVM/Views/ViewUtilities.h"
+#include "Editor.h"
+#include "HAL/PlatformTime.h"
+#include "Misc/MessageDialog.h"
 #include "MovieScene.h"
 #include "ScopedTransaction.h"
+#include "Subsystems/AssetEditorSubsystem.h"
 #include "Framework/Application/SlateApplication.h"
 #include "SequencerToolMenuContext.h"
 #include "Styling/AppStyle.h"
@@ -536,13 +540,33 @@ bool FMotionPromptTrackEditor::CanGenerate(UMovieSceneTrack* Track, FText& OutRe
 		return false;
 	}
 
-	OutReason = FText::Format(
-		LOCTEXT("GenReady",
-			"Generate '{0}' from these beats. The take lands on the animation row below, replacing the "
-			"one there. Free and about fifteen seconds on a local provider."),
-		FText::FromString(Definition->GetName()));
+	// What pressing it sends and costs, from the resolver Generate itself uses. Asked every frame by
+	// the toolbar, so kept for a second rather than resolved each time.
+	struct FVerdict { double At = 0.0; bool bCan = false; FText Reason; };
+	static TMap<FString, FVerdict> Verdicts;
 
-	return true;
+	const FString Path = Definition->GetPathName();
+	FVerdict& Verdict = Verdicts.FindOrAdd(Path);
+
+	if (FPlatformTime::Seconds() - Verdict.At > 1.0)
+	{
+		Verdict.At = FPlatformTime::Seconds();
+
+		UMotionForgeSubsystem* Forge = UMotionForgeSubsystem::Get();
+		const FMotionResolvedRequest Resolved = Forge ? Forge->ResolveRequest(Path) : FMotionResolvedRequest();
+
+		Verdict.bCan = Resolved.bCanSubmit;
+		Verdict.Reason = Resolved.bCanSubmit
+			? FText::Format(
+				LOCTEXT("GenReadyFmt",
+					"Generate '{0}' from these beats. {1}\n\nThe takes stop for review in the definition's "
+					"window, which opens; the one you choose lands on the animation row below."),
+				FText::FromString(Definition->GetName()), FText::FromString(Resolved.Cost.Summary))
+			: FText::FromString(Resolved.Readiness.Problem);
+	}
+
+	OutReason = Verdict.Reason;
+	return Verdict.bCan;
 }
 
 TSharedPtr<SWidget> FMotionPromptTrackEditor::BuildOutlinerEditWidget(
@@ -669,26 +693,54 @@ void FMotionPromptTrackEditor::BuildTrackContextMenu(FMenuBuilder& MenuBuilder, 
 
 	MenuBuilder.AddSeparator();
 
+	// Poses only mean something to a provider that takes them. Offered to the others disabled, with
+	// the reason, so the difference between providers is learnt here rather than from a take that
+	// silently ignored twenty keys.
+	FText NoPosesReason;
+	{
+		const UMotionDef* Def = PromptTrack->Definition.Get();
+		UMotionForgeSubsystem* Forge = UMotionForgeSubsystem::Get();
+		if (Def && Forge)
+		{
+			const FMotionProviderCaps Caps = Forge->GetProviderCaps(Def->ProviderId);
+			if (Caps.ConstraintTypes.Num() == 0)
+			{
+				NoPosesReason = FText::Format(
+					LOCTEXT("NoPosesFmt", "{0} takes no poses: the prompt alone decides the body. Kimodo takes poses at moments; switch the definition to it to direct with the rig."),
+					FText::FromString(Caps.DisplayName.IsEmpty() ? Caps.ProviderId.ToString() : Caps.DisplayName));
+			}
+		}
+	}
+	const bool bTakesPoses = NoPosesReason.IsEmpty();
+
 	MenuBuilder.AddMenuEntry(
 		LOCTEXT("PushConstraintsEntry", "Put Definition's Constraints on the Rig"),
-		LOCTEXT("PushConstraintsEntryTooltip",
-			"Take the poses already authored on the Motion Definition and key them onto this sequence's "
-			"Control Rig, at their own frames. "
-			"The direction that was missing: without it, a definition that already has constraints shows "
-			"none on its timeline - and the moment anything is keyed on the rig, the sequence wins and "
-			"those authored keys stop being sent at all. This puts them all on one timeline."),
+		bTakesPoses
+			? LOCTEXT("PushConstraintsEntryTooltip",
+				"Take the poses already authored on the Motion Definition and key them onto this sequence's "
+				"Control Rig, at their own frames. "
+				"The direction that was missing: without it, a definition that already has constraints shows "
+				"none on its timeline - and the moment anything is keyed on the rig, the sequence wins and "
+				"those authored keys stop being sent at all. This puts them all on one timeline.")
+			: NoPosesReason,
 		FSlateIcon(),
-		FUIAction(FExecuteAction::CreateLambda([this, Track]() { HandlePushConstraints(Track); })));
+		FUIAction(
+			FExecuteAction::CreateLambda([this, Track]() { HandlePushConstraints(Track); }),
+			FCanExecuteAction::CreateLambda([bTakesPoses]() { return bTakesPoses; })));
 
 	MenuBuilder.AddMenuEntry(
 		LOCTEXT("CopyPoseEntry", "Copy Take's Pose to Rig at Playhead"),
-		LOCTEXT("CopyPoseEntryTooltip",
-			"Take the generated clip's pose at the playhead and key it onto this sequence's Control "
-			"Rig, there. Scrub to where the take looks right, copy, then drag the rig's keys to where "
-			"it goes wrong - those moments become constraints on the next generation.\n\n"
-			"Needs a generated take and a Control Rig on the Motion Character."),
+		bTakesPoses
+			? LOCTEXT("CopyPoseEntryTooltip",
+				"Take the generated clip's pose at the playhead and key it onto this sequence's Control "
+				"Rig, there. Scrub to where the take looks right, copy, then drag the rig's keys to where "
+				"it goes wrong - those moments become constraints on the next generation.\n\n"
+				"Needs a generated take and a Control Rig on the Motion Character.")
+			: NoPosesReason,
 		FSlateIcon(),
-		FUIAction(FExecuteAction::CreateLambda([this, Track]() { HandleCopyPoseToRig(Track); })));
+		FUIAction(
+			FExecuteAction::CreateLambda([this, Track]() { HandleCopyPoseToRig(Track); }),
+			FCanExecuteAction::CreateLambda([bTakesPoses]() { return bTakesPoses; })));
 
 	MenuBuilder.AddSeparator();
 
@@ -814,6 +866,11 @@ void FMotionPromptTrackEditor::HandleBake(UMovieSceneTrack* Track)
 		return;
 	}
 
+	// Undoable, like every other edit made from the track: it rewrites the definition's prompt, beat
+	// durations, length and authored poses.
+	const FScopedTransaction Transaction(LOCTEXT("BakeTransaction", "Bake Sequence Into Definition"));
+	Definition->Modify();
+
 	FString Error;
 	if (!Forge->BakePromptSequence(Definition->GetPathName(), Error))
 	{
@@ -838,6 +895,21 @@ FReply FMotionPromptTrackEditor::HandlePull(UMovieSceneTrack* Track)
 			TEXT("This prompt track names no Motion Definition, so there is nothing to pull. Set one "
 				 "in the track's Details first."));
 		return FReply::Handled();
+	}
+
+	// Asked first when there is something to lose: beats edited here and not baked into the definition.
+	// Pull replaces them, and "it is undoable" is no comfort to somebody who did not know it would.
+	FString SyncDetail;
+	if (FMotionPromptSequence::GetSyncState(PromptTrack, SyncDetail) == EMotionPromptSync::Ahead)
+	{
+		const FText Question = FText::Format(LOCTEXT("PullConfirmFmt",
+			"The beats on this track have been edited since '{0}' last took them. Pull replaces them with "
+			"the definition's own prompt and durations.\n\nBake Sequence Into Definition keeps them instead. "
+			"Pull anyway? Undo brings them back."), FText::FromString(Definition->GetName()));
+		if (FMessageDialog::Open(EAppMsgType::OkCancel, Question, LOCTEXT("PullConfirmTitle", "Replace the beats")) != EAppReturnType::Ok)
+		{
+			return FReply::Handled();
+		}
 	}
 
 	// The generator's rate, so the beats land on whole generated frames. Asked of the provider rather
@@ -946,19 +1018,35 @@ void FMotionPromptTrackEditor::Generate(UMovieSceneTrack* Track)
 		return;
 	}
 
-	// Automatic, so the take comes back and lands on the animation row without a second gesture. That
-	// is the whole loop: change a beat, press this, watch the row below change.
-	//
-	// Non-blocking - it returns a batch id immediately and the import happens when the provider
-	// answers. The button reads busy meanwhile because `IsBusy` is what CanGenerate checks, and the
+	// Money is asked about, never assumed - the same rule as the definition window's button.
+	const FMotionResolvedRequest Resolved = Forge->ResolveRequest(Definition->GetPathName());
+	if (Resolved.Cost.bSpendsMoney || Resolved.Cost.bHourlyBillingNow)
+	{
+		const FText Question = FText::Format(
+			LOCTEXT("TimelineConfirmSpendFmt", "{0}\n\nGenerate '{1}' from these beats?"),
+			FText::FromString(Resolved.Cost.Summary), FText::FromString(Definition->GetName()));
+		if (FMessageDialog::Open(EAppMsgType::OkCancel, Question, LOCTEXT("TimelineConfirmSpendTitle", "Generating costs money")) != EAppReturnType::Ok)
+		{
+			return;
+		}
+	}
+
+	// Stops for review, like every human Generate: the takes are watched in the definition's window,
+	// and the one chosen there is imported and placed on the animation row below. Non-blocking - the
 	// subsystem refuses a definition already in flight, so a second press cannot pay twice.
-	const FString BatchId = Forge->RunFullPipeline({ Definition->GetPathName() });
+	const FString BatchId = Forge->Generate({ Definition->GetPathName() });
 
 	if (BatchId.IsEmpty())
 	{
 		UE_LOG(LogMotionForge, Warning,
-			TEXT("Nothing was eligible to generate for '%s'. The provider may not be running."),
+			TEXT("Nothing was eligible to generate for '%s'. Open it to see what it is waiting for."),
 			*Definition->GetName());
+		return;
+	}
+
+	if (GEditor)
+	{
+		GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(Definition);
 	}
 }
 

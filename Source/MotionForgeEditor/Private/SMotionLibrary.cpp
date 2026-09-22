@@ -3,6 +3,7 @@
 #include "SMotionLibrary.h"
 
 #include "MotionDef.h"
+#include "MotionForgeEditorStyle.h"
 #include "MotionForgeFactories.h"
 #include "MotionForgeSettings.h"
 #include "MotionForgeSubsystem.h"
@@ -12,6 +13,7 @@
 #include "AssetToolsModule.h"
 #include "Editor.h"
 #include "IAssetTools.h"
+#include "Misc/MessageDialog.h"
 #include "Misc/PackageName.h"
 #include "Modules/ModuleManager.h"
 #include "Styling/AppStyle.h"
@@ -55,7 +57,7 @@ namespace MotionLibraryUI
 	TSharedRef<SBorder> Card(TSharedRef<SWidget> Content)
 	{
 		return SNew(SBorder)
-			.BorderImage(FAppStyle::GetBrush("Brushes.Header"))
+			.BorderImage(MotionForgeStyle::SectionBrush())
 			.Padding(FMargin(16.f, 14.f))
 			[
 				Content
@@ -173,6 +175,78 @@ namespace MotionLibraryUI
 			}
 		}
 		return Count;
+	}
+
+	/**
+	 * What generating these definitions would cost, from the resolver Generate itself uses - each
+	 * definition on its own provider, its own length, its own number of takes.
+	 *
+	 * @param bOutSpends True when any of it bills: generated seconds, or a rented machine that is up.
+	 */
+	FText PriceSelection(const TArray<TSharedPtr<FMotionLibraryEntry>>& Entries, bool& bOutSpends)
+	{
+		bOutSpends = false;
+
+		UMotionForgeSubsystem* Subsystem = UMotionForgeSubsystem::Get();
+		if (!Subsystem || Entries.Num() == 0)
+		{
+			return FText::GetEmpty();
+		}
+
+		double Money = 0.0;
+		FString Currency = TEXT("USD");
+		int32 BilledSeconds = 0;
+		int32 Takes = 0;
+		TArray<FString> FreeOn;
+		TMap<FString, float> HourlyNow;
+
+		for (const TSharedPtr<FMotionLibraryEntry>& Entry : Entries)
+		{
+			if (!Entry.IsValid())
+			{
+				continue;
+			}
+
+			const FMotionResolvedRequest Resolved = Subsystem->ResolveRequest(Entry->Status.AssetPath);
+			Takes += FMath::Max(1, Resolved.Variants);
+
+			if (Resolved.Cost.bSpendsMoney)
+			{
+				Money += Resolved.Cost.EstimatedCost;
+				BilledSeconds += Resolved.Cost.BilledSeconds;
+				Currency = Resolved.Cost.Currency;
+				bOutSpends = true;
+			}
+			else
+			{
+				FreeOn.AddUnique(Resolved.ProviderDisplayName);
+			}
+
+			if (Resolved.Cost.bHourlyBillingNow)
+			{
+				HourlyNow.Add(Resolved.ProviderDisplayName, Resolved.Cost.HourlyRate);
+				bOutSpends = true;
+			}
+		}
+
+		TArray<FString> Parts;
+		if (Money > 0.0 || BilledSeconds > 0)
+		{
+			Parts.Add(FString::Printf(TEXT("about %s for %d s billed"), *MotionForgeStyle::Money(Money, Currency), BilledSeconds));
+		}
+		if (FreeOn.Num() > 0)
+		{
+			Parts.Add(FString::Printf(TEXT("free on %s"), *FString::Join(FreeOn, TEXT(" and "))));
+		}
+		for (const TPair<FString, float>& Hourly : HourlyNow)
+		{
+			Parts.Add(FString::Printf(TEXT("%s's rented GPU bills %s an hour while it is up"),
+				*Hourly.Key, *MotionForgeStyle::Money(Hourly.Value, Currency)));
+		}
+
+		return FText::Format(
+			LOCTEXT("LibPriceFmt", "Generating {0} {0}|plural(one=definition,other=definitions), {1} {1}|plural(one=take,other=takes): {2}."),
+			Entries.Num(), Takes, FText::FromString(FString::Join(Parts, TEXT("; "))));
 	}
 
 	/** A prompt on one line, so a row stays a row. The full text is on the tooltip. */
@@ -885,55 +959,12 @@ TSharedRef<SWidget> SMotionLibrary::BuildFooter()
 	// the one nobody prices in their head.
 	FText CostLine;
 	FLinearColor CostColour = MFL::QuietColour;
-	bool bMetered = false;
 
 	if (Generateable.Num() > 0)
 	{
-		if (UMotionForgeSubsystem* Subsystem = UMotionForgeSubsystem::Get())
-		{
-			TArray<FMotionDefSpec> Specs;
-			Specs.Reserve(Generateable.Num());
-
-			for (const TSharedPtr<FMotionLibraryEntry>& Entry : Generateable)
-			{
-				FMotionDefSpec Spec;
-				Spec.Length     = Entry->Status.Length;
-				Spec.Variants   = Entry->Status.Variants;
-				Spec.ProviderId = Entry->Status.ProviderId;
-				Specs.Add(MoveTemp(Spec));
-
-				bMetered |= Subsystem->GetProviderCaps(Entry->Status.ProviderId).bIsMetered;
-			}
-
-			const FMotionCostEstimate Estimate = Subsystem->EstimateGenerationCost(Specs);
-
-			if (!bMetered)
-			{
-				CostLine = FText::Format(
-					LOCTEXT("LibCostFreeFmt",
-						"Generating {0} {0}|plural(one=definition,other=definitions) - free on this "
-						"provider, so ask for more takes"),
-					Generateable.Num());
-			}
-			else if (Estimate.EstimatedCost > 0.f)
-			{
-				CostLine = FText::Format(
-					LOCTEXT("LibCostMoneyFmt",
-						"Generating {0} {0}|plural(one=definition,other=definitions) = {1}s billed, "
-						"about {2} {3}"),
-					Generateable.Num(), Estimate.BilledSeconds,
-					MFL::Money(Estimate.EstimatedCost), FText::FromString(Estimate.Currency));
-				CostColour = MFL::WarnColour;
-			}
-			else
-			{
-				CostLine = FText::Format(
-					LOCTEXT("LibCostSecondsFmt",
-						"Generating {0} {0}|plural(one=definition,other=definitions) = {1}s billed"),
-					Generateable.Num(), Estimate.BilledSeconds);
-				CostColour = MFL::WarnColour;
-			}
-		}
+		bool bSpends = false;
+		CostLine = MFL::PriceSelection(Generateable, bSpends);
+		CostColour = bSpends ? MFL::WarnColour : MFL::QuietColour;
 	}
 	else if (Selected.Num() > 0)
 	{
@@ -1252,17 +1283,35 @@ FReply SMotionLibrary::OnGenerateSelected()
 		return FReply::Handled();
 	}
 
+	const TArray<TSharedPtr<FMotionLibraryEntry>> Selection = GenerateableSelection();
+
 	TArray<FString> Paths;
-	for (const TSharedPtr<FMotionLibraryEntry>& Entry : GenerateableSelection())
+	for (const TSharedPtr<FMotionLibraryEntry>& Entry : Selection)
 	{
 		Paths.Add(Entry->Status.AssetPath);
 	}
 
-	if (Paths.Num() > 0)
+	if (Paths.Num() == 0)
 	{
-		Subsystem->Generate(Paths);
-		Rescan();
+		return FReply::Handled();
 	}
+
+	// Money is always asked about, never assumed. The same sentence the footer shows, priced again
+	// now in case a setting moved since it was drawn.
+	bool bSpends = false;
+	const FText Price = MFL::PriceSelection(Selection, bSpends);
+	if (bSpends)
+	{
+		const FText Question = FText::Format(LOCTEXT("LibConfirmSpendFmt",
+			"{0}\n\nEvery take stops for review when it finishes; nothing is imported until you choose. Generate?"), Price);
+		if (FMessageDialog::Open(EAppMsgType::OkCancel, Question, LOCTEXT("LibConfirmSpendTitle", "Generating costs money")) != EAppReturnType::Ok)
+		{
+			return FReply::Handled();
+		}
+	}
+
+	Subsystem->Generate(Paths);
+	Rescan();
 
 	return FReply::Handled();
 }
@@ -1281,11 +1330,25 @@ FReply SMotionLibrary::OnImportSelected()
 		Paths.Add(Entry->Status.AssetPath);
 	}
 
-	if (Paths.Num() > 0)
+	if (Paths.Num() == 0)
 	{
-		Subsystem->DownloadSelected(Paths);
-		Rescan();
+		return FReply::Handled();
 	}
+
+	// On a subscription, fetching is what bills. Priced by the provider that made each take, and asked.
+	const FMotionCostEstimate Estimate = Subsystem->EstimateCost(Paths, /*bSelectedOnly=*/true);
+	if (Estimate.bSpendsMoney)
+	{
+		const FText Question = FText::Format(LOCTEXT("LibConfirmFetchFmt", "{0}\n\nImport {1} {1}|plural(one=take,other=takes)?"),
+			FText::FromString(Estimate.Summary), Paths.Num());
+		if (FMessageDialog::Open(EAppMsgType::OkCancel, Question, LOCTEXT("LibConfirmFetchTitle", "Importing uses quota")) != EAppReturnType::Ok)
+		{
+			return FReply::Handled();
+		}
+	}
+
+	Subsystem->DownloadSelected(Paths);
+	Rescan();
 
 	return FReply::Handled();
 }

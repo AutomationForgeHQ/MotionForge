@@ -8,6 +8,7 @@
 #include "MotionCredentialStore.h"
 #include "MotionNormalizeTask.h"
 #include "MotionImporter.h"
+#include "MotionPipeline.h"
 
 #include "Animation/AnimSequence.h"
 #include "Animation/Skeleton.h"
@@ -21,7 +22,11 @@
 #include "AssetRegistry/IAssetRegistry.h"
 #include "Dom/JsonObject.h"
 #include "Editor.h"
+#include "Hash/CityHash.h"
+#include "AnimPose.h"
 #include "LevelSequence.h"
+#include "Retargeter/IKRetargetProcessor.h"
+#include "Retargeter/IKRetargetProfile.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "ObjectTools.h"
@@ -77,6 +82,78 @@ namespace MotionForgeJson
 	}
 }
 
+namespace MotionForgeCost
+{
+	/** Money to two places, with the currency symbol people expect for the common ones. */
+	static FString Money(double Amount, const FString& Currency)
+	{
+		const FString Number = FString::Printf(TEXT("%.2f"), Amount);
+
+		if (Currency == TEXT("USD")) { return TEXT("$") + Number; }
+		if (Currency == TEXT("EUR")) { return TEXT("EUR ") + Number; }
+		if (Currency == TEXT("GBP")) { return TEXT("GBP ") + Number; }
+		if (Currency == TEXT("CHF")) { return TEXT("CHF ") + Number; }
+
+		return Number + TEXT(" ") + Currency;
+	}
+
+	static FString Seconds(float Value)
+	{
+		return FMath::IsNearlyEqual(Value, FMath::RoundToFloat(Value), 0.01f)
+			? FString::Printf(TEXT("%d s"), FMath::RoundToInt(Value))
+			: FString::Printf(TEXT("%.1f s"), Value);
+	}
+
+	static FString Takes(int32 Count)
+	{
+		return Count == 1 ? TEXT("1 take") : FString::Printf(TEXT("%d takes"), Count);
+	}
+}
+
+namespace MotionForgePrompt
+{
+	/**
+	 * A prompt cut the way a provider that splits at full stops cuts it.
+	 *
+	 * Mirrors the runner's own split_prompt, which mirrors kimodo_gen: on "." and nothing else, empty
+	 * pieces dropped. Pairing sentence i with duration i here is not a guess - it is exactly how the
+	 * provider will pair them.
+	 */
+	static TArray<FString> Split(const FString& Prompt)
+	{
+		TArray<FString> Pieces;
+		Prompt.ParseIntoArray(Pieces, TEXT("."), /*bCullEmpty*/ false);
+
+		TArray<FString> Beats;
+		for (FString& Piece : Pieces)
+		{
+			Piece.TrimStartAndEndInline();
+			if (!Piece.IsEmpty())
+			{
+				Beats.Add(Piece);
+			}
+		}
+		return Beats;
+	}
+
+	/** The first number written with a decimal point, which a splitting provider cuts in two. */
+	static FString FindDecimal(const FString& Prompt)
+	{
+		for (int32 Index = 1; Index + 1 < Prompt.Len(); ++Index)
+		{
+			if (Prompt[Index] == TEXT('.') && FChar::IsDigit(Prompt[Index - 1]) && FChar::IsDigit(Prompt[Index + 1]))
+			{
+				int32 Start = Index - 1;
+				while (Start > 0 && FChar::IsDigit(Prompt[Start - 1])) { --Start; }
+				int32 End = Index + 1;
+				while (End + 1 < Prompt.Len() && FChar::IsDigit(Prompt[End + 1])) { ++End; }
+				return Prompt.Mid(Start, End - Start + 1);
+			}
+		}
+		return FString();
+	}
+}
+
 // -------------------------------------------------------------------------------------------------
 // Lifetime
 // -------------------------------------------------------------------------------------------------
@@ -107,6 +184,9 @@ void UMotionForgeSubsystem::Deinitialize()
 	}
 
 	Batches.Empty();
+	Activities.Empty();
+	Previews.Empty();
+	PreviewWaiters.Empty();
 
 	Super::Deinitialize();
 }
@@ -115,15 +195,26 @@ void UMotionForgeSubsystem::ReleaseStrandedDefinitions()
 {
 	// Batches live in memory and nowhere else, so nothing can be mid-flight at startup - whatever was
 	// tracking these definitions died with the last editor. A definition left saying Generating is
-	// therefore stale **by construction**, and `IsBusy` refuses to submit it ever again: the Generate
-	// button reports "already generating" for a batch that cannot exist, with no way out but editing
-	// the asset by hand.
+	// therefore stale **by construction**, and `IsBusy` refuses to submit it ever again.
 	//
 	// Found the honest way, by closing the editor for a build while a generation was in flight.
 	int32 Released = 0;
 
 	for (const FString& Path : FindMotionDefs({}))
 	{
+		// Status is on the registry tag for anything saved since tags existed, so most of the library
+		// is skipped without being loaded.
+		const FAssetRegistryModule& Registry =
+			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		const FAssetData Data = Registry.Get().GetAssetByObjectPath(FSoftObjectPath(Path));
+
+		FString Tag;
+		if (Data.IsValid() && Data.GetTagValue(UMotionDef::TagStatus, Tag)
+			&& Tag != TEXT("Generating") && Tag != TEXT("Downloading") && Tag != TEXT("Processing"))
+		{
+			continue;
+		}
+
 		UMotionDef* Def = LoadDef(Path);
 
 		if (Def == nullptr || !Def->IsBusy())
@@ -131,22 +222,9 @@ void UMotionForgeSubsystem::ReleaseStrandedDefinitions()
 			continue;
 		}
 
-		// Candidates are never touched. Jobs submitted before the restart may well have finished on
-		// the provider, and their motion ids are the only route back to those takes - so a definition
-		// with usable ones goes to review rather than being written off.
-		if (Def->CountUsableCandidates() > 0)
-		{
-			Def->SetStatus(EMotionDefStatus::AwaitingReview);
-		}
-		else
-		{
-			Def->SetStatus(EMotionDefStatus::Failed,
-				TEXT("The editor closed while this was generating, so nothing was left tracking it. "
-					 "Generating again is safe; any takes the provider did finish are still listed as "
-					 "candidates."));
-		}
-
-		SaveAsset(Def);
+		SettleDefinition(Def,
+			TEXT("The editor closed while this was working, so nothing was left tracking it. Generating "
+				 "again is safe; any takes the provider did finish are still listed."));
 		++Released;
 	}
 
@@ -164,49 +242,64 @@ UMotionForgeSubsystem* UMotionForgeSubsystem::Get()
 	return GEditor ? GEditor->GetEditorSubsystem<UMotionForgeSubsystem>() : nullptr;
 }
 
+FName UMotionForgeSubsystem::ResolveProviderId(FName ProviderId)
+{
+	if (!ProviderId.IsNone())
+	{
+		return ProviderId;
+	}
+
+	// One place decides what None means - the setting, or the only provider installed. Two call sites
+	// used to disagree, and a definition then resolved to one provider for readiness and another for
+	// submission.
+	const FMotionForgeModule* Module = FMotionForgeModule::GetPtrIfLoaded();
+	return Module ? Module->ResolveDefaultProviderId() : NAME_None;
+}
+
 TSharedPtr<IMotionProvider> UMotionForgeSubsystem::FindProvider(FName ProviderId) const
 {
 	const FMotionForgeModule* Module = FMotionForgeModule::GetPtr();
-	if (!Module)
-	{
-		return nullptr;
-	}
-
-	const FName Resolved = ProviderId.IsNone() ? UMotionForgeSettings::Get()->DefaultProviderId : ProviderId;
-	return Module->FindProvider(Resolved);
+	return Module ? Module->FindProvider(ResolveProviderId(ProviderId)) : nullptr;
 }
 
 FMotionReadiness UMotionForgeSubsystem::CheckReadiness(const FString& AssetPath) const
 {
-	FMotionReadiness Readiness;
-
 	UMotionDef* Def = LoadDef(AssetPath);
 	if (!Def)
 	{
+		FMotionReadiness Readiness;
 		Readiness.Blocker = EMotionBlocker::NoProvider;
 		Readiness.Problem = FString::Printf(TEXT("No motion definition at '%s'."), *AssetPath);
 		return Readiness;
 	}
 
-	TSharedPtr<IMotionProvider> Provider;
-	UMotionCharacter* Character = nullptr;
-	FString Error;
+	FMotionResolvedRequest Resolved;
+	ResolveInternal(Def, Resolved, nullptr, /*bForSubmit*/ false);
+	return Resolved.Readiness;
+}
 
-	Readiness.bCanGenerate = ResolveDefinition(Def, Provider, Character, Error, &Readiness.Blocker);
-	Readiness.Problem = Readiness.bCanGenerate ? FString() : Error;
+FMotionResolvedRequest UMotionForgeSubsystem::ResolveRequest(const FString& AssetPath) const
+{
+	FMotionResolvedRequest Resolved;
 
-	return Readiness;
+	UMotionDef* Def = LoadDef(AssetPath);
+	if (!Def)
+	{
+		Resolved.AssetPath = AssetPath;
+		Resolved.Readiness.Blocker = EMotionBlocker::NoProvider;
+		Resolved.Readiness.Problem = FString::Printf(TEXT("No motion definition at '%s'."), *AssetPath);
+		return Resolved;
+	}
+
+	ResolveInternal(Def, Resolved, nullptr, /*bForSubmit*/ false);
+	return Resolved;
 }
 
 void UMotionForgeSubsystem::NotifyProviderStateChanged(FName ProviderId)
 {
 	// Resolved, so a listener comparing against the id it drew with always matches - a definition
 	// with no provider set is drawn with the default's caps and must still hear about them.
-	const FName Resolved = ProviderId.IsNone()
-		? UMotionForgeSettings::Get()->DefaultProviderId
-		: ProviderId;
-
-	ProviderStateChanged.Broadcast(Resolved);
+	ProviderStateChanged.Broadcast(ResolveProviderId(ProviderId));
 }
 
 void UMotionForgeSubsystem::RefreshProviderState(FName ProviderId)
@@ -235,16 +328,71 @@ TArray<FName> UMotionForgeSubsystem::GetProviderIds() const
 	return Module ? Module->GetProviderIds() : TArray<FName>();
 }
 
-FMotionProviderCaps UMotionForgeSubsystem::GetProviderCaps(FName ProviderId) const
+TArray<FMotionSetupStepInfo> UMotionForgeSubsystem::GetSetupSteps(FName ProviderId) const
 {
-	if (TSharedPtr<IMotionProvider> Provider = FindProvider(ProviderId))
+	TArray<FMotionSetupStepInfo> Out;
+
+	const TArray<FName> Ids = ProviderId.IsNone() ? GetProviderIds() : TArray<FName>{ ProviderId };
+
+	for (const FName Id : Ids)
 	{
-		return Provider->GetCaps();
+		TSharedPtr<IMotionProvider> Provider = FindProvider(Id);
+		if (!Provider.IsValid())
+		{
+			continue;
+		}
+
+		TArray<FMotionSetupStep> Steps;
+		Provider->GetSetupSteps(Steps);
+
+		for (const FMotionSetupStep& Step : Steps)
+		{
+			FMotionSetupStepInfo& Info = Out.AddDefaulted_GetRef();
+			Info.ProviderId = Provider->GetProviderId();
+			Info.Label = Step.Label.ToString();
+			Info.Detail = Step.Detail.ToString();
+			Info.ActionLabel = Step.ActionLabel.ToString();
+			Info.HelpUrl = Step.HelpUrl;
+			Info.bOptional = Step.bOptional;
+
+			switch (Step.State)
+			{
+			case EMotionSetupState::Done:    Info.State = TEXT("Done"); break;
+			case EMotionSetupState::Todo:    Info.State = TEXT("Todo"); break;
+			case EMotionSetupState::Waiting: Info.State = TEXT("Waiting"); break;
+			case EMotionSetupState::Blocked: Info.State = TEXT("Blocked"); break;
+			default:                         Info.State = TEXT("Unknown"); break;
+			}
+		}
 	}
 
-	// An empty ProviderId is the "no such provider" answer. Returning defaults with the id filled in
-	// would look like a real capability report for a provider that does not exist.
-	return FMotionProviderCaps();
+	return Out;
+}
+
+FMotionProviderCaps UMotionForgeSubsystem::GetProviderCaps(FName ProviderId) const
+{
+	TSharedPtr<IMotionProvider> Provider = FindProvider(ProviderId);
+	if (!Provider.IsValid())
+	{
+		// An empty ProviderId is the "no such provider" answer. Returning defaults with the id filled
+		// in would look like a real capability report for a provider that does not exist.
+		return FMotionProviderCaps();
+	}
+
+	// The declarations are gathered here rather than asked of every provider's GetCaps, so a provider
+	// states each fact once, in the function named for it.
+	FMotionProviderCaps Caps = Provider->GetCaps();
+	Caps.Models = Provider->GetModels();
+	Caps.PromptSplitting = Provider->GetPromptSplitting();
+	Caps.Billing = Provider->GetBilling();
+	Caps.Tagline = Provider->GetTagline().ToString();
+
+	if (UClass* PipelineClass = Provider->GetPipelineClass())
+	{
+		Caps.PipelineClass = PipelineClass->GetPathName();
+	}
+
+	return Caps;
 }
 
 int32 UMotionForgeSubsystem::ResolveFrameRate(const TSharedPtr<IMotionProvider>& Provider)
@@ -258,7 +406,7 @@ int32 UMotionForgeSubsystem::ResolveFrameRate(const TSharedPtr<IMotionProvider>&
 		}
 	}
 
-	return UMotionForgeSettings::Get()->TargetFrameRate;
+	return 30;
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -276,21 +424,44 @@ UMotionDef* UMotionForgeSubsystem::LoadDef(const FString& AssetPath) const
 
 FString UMotionForgeSubsystem::CreateMotionDef(const FMotionDefSpec& Spec)
 {
+	TArray<FString> Problems;
+	return CreateMotionDefChecked(Spec, Problems);
+}
+
+FString UMotionForgeSubsystem::CreateMotionDefChecked(const FMotionDefSpec& Spec, TArray<FString>& OutProblems)
+{
 	const UMotionForgeSettings* Settings = UMotionForgeSettings::Get();
 
 	FString AssetName = Spec.AssetName.IsEmpty() ? TEXT("MD_Untitled") : Spec.AssetName;
 	AssetName = ObjectTools::SanitizeObjectName(AssetName);
 
-	const FString PackagePath = Settings->GetDefinitionsPath() / AssetName;
-
-	// Creating over an existing definition would drop its candidates, and on providers with no seed
-	// those takes cannot be regenerated. Update the existing one instead.
-	if (UMotionDef* Existing = LoadObject<UMotionDef>(nullptr, *(PackagePath + TEXT(".") + AssetName)))
+	// Creating over an existing definition would drop its takes, and on providers with no seed those
+	// cannot be made again. Found by name anywhere in the project, not only under today's output root -
+	// moving the root used to make this create a second definition of the same name somewhere else.
 	{
-		Existing->ApplySpec(Spec);
-		SaveAsset(Existing);
-		return Existing->GetPathName();
+		const FAssetRegistryModule& Registry =
+			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+
+		TArray<FAssetData> Assets;
+		Registry.Get().GetAssetsByClass(UMotionDef::StaticClass()->GetClassPathName(), Assets, true);
+
+		for (const FAssetData& Asset : Assets)
+		{
+			if (Asset.AssetName.ToString() == AssetName)
+			{
+				if (UMotionDef* Existing = Cast<UMotionDef>(Asset.GetAsset()))
+				{
+					Existing->Modify();
+					Existing->ApplySpec(Spec, &OutProblems);
+					Existing->MarkPackageDirty();
+					SaveAsset(Existing);
+					return Existing->GetPathName();
+				}
+			}
+		}
 	}
+
+	const FString PackagePath = Settings->GetDefinitionsPath() / AssetName;
 
 	UPackage* Package = CreatePackage(*PackagePath);
 	if (!Package)
@@ -299,16 +470,25 @@ FString UMotionForgeSubsystem::CreateMotionDef(const FMotionDefSpec& Spec)
 		return FString();
 	}
 
-	UMotionDef* Def = NewObject<UMotionDef>(Package, *AssetName, RF_Public | RF_Standalone);
+	UMotionDef* Def = NewObject<UMotionDef>(Package, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
 	if (!Def)
 	{
 		return FString();
 	}
 
-	Def->ApplySpec(Spec);
+	// Provider first, so the defaults pick a character that suits it, then everything else the spec says.
+	if (!Spec.ProviderId.IsNone())
+	{
+		Def->ProviderId = Spec.ProviderId;
+	}
 	Def->ApplyProjectDefaults();
+	Def->ApplySpec(Spec, &OutProblems);
 
 	FAssetRegistryModule::AssetCreated(Def);
+
+	// A package created from C++ is not dirty, and SaveAsset skips clean packages - so without this a
+	// new definition existed in memory and nowhere else.
+	Def->MarkPackageDirty();
 	SaveAsset(Def);
 
 	UE_LOG(LogMotionForge, Log, TEXT("Created motion definition '%s'."), *Def->GetPathName());
@@ -317,13 +497,21 @@ FString UMotionForgeSubsystem::CreateMotionDef(const FMotionDefSpec& Spec)
 
 bool UMotionForgeSubsystem::UpdateMotionDef(const FString& AssetPath, const FMotionDefSpec& Spec)
 {
+	TArray<FString> Problems;
+	return UpdateMotionDefChecked(AssetPath, Spec, Problems);
+}
+
+bool UMotionForgeSubsystem::UpdateMotionDefChecked(const FString& AssetPath, const FMotionDefSpec& Spec, TArray<FString>& OutProblems)
+{
 	UMotionDef* Def = LoadDef(AssetPath);
 	if (!Def)
 	{
 		return false;
 	}
 
-	Def->ApplySpec(Spec);
+	Def->Modify();
+	Def->ApplySpec(Spec, &OutProblems);
+	Def->MarkPackageDirty();
 	SaveAsset(Def);
 	return true;
 }
@@ -338,16 +526,30 @@ TArray<FString> UMotionForgeSubsystem::FindMotionDefs(const TArray<EMotionDefSta
 	TArray<FAssetData> Assets;
 	Registry.Get().GetAssetsByClass(UMotionDef::StaticClass()->GetClassPathName(), Assets, /*bSearchSubClasses*/ true);
 
+	const UEnum* StatusEnum = StaticEnum<EMotionDefStatus>();
+
 	for (const FAssetData& Asset : Assets)
 	{
-		// Status lives inside the asset, so filtering means loading it. Skip that entirely when the
-		// caller wants everything - listing a large library should not fault in every definition.
 		if (StatusFilter.Num() > 0)
 		{
-			const UMotionDef* Def = Cast<UMotionDef>(Asset.GetAsset());
-			if (!Def || !StatusFilter.Contains(Def->Status))
+			// The saved tag answers without loading. Only an asset saved before tags existed has to be
+			// loaded to be asked.
+			FString Tag;
+			if (Asset.GetTagValue(UMotionDef::TagStatus, Tag) && StatusEnum)
 			{
-				continue;
+				const int64 Value = StatusEnum->GetValueByNameString(Tag);
+				if (Value == INDEX_NONE || !StatusFilter.Contains(static_cast<EMotionDefStatus>(Value)))
+				{
+					continue;
+				}
+			}
+			else
+			{
+				const UMotionDef* Def = Cast<UMotionDef>(Asset.GetAsset());
+				if (!Def || !StatusFilter.Contains(Def->Status))
+				{
+					continue;
+				}
 			}
 		}
 
@@ -477,28 +679,23 @@ void UMotionForgeSubsystem::UploadCharacter(
 	{
 		OnComplete(false, Empty, FString::Printf(
 			TEXT("'%s' is already paired with provider character '%s'. Uploading again would create a "
-				 "second character and orphan takes generated against the first. Pass Force if that "
-				 "is genuinely what you want."),
+				 "second character and orphan takes generated against the first."),
 			*Character->GetDisplayName(), *Character->ProviderCharacterId));
 		return;
 	}
 
-	const FName ProviderId = Character->ProviderId.IsNone()
-		? UMotionForgeSettings::Get()->DefaultProviderId
-		: Character->ProviderId;
-
-	TSharedPtr<IMotionProvider> Provider = FindProvider(ProviderId);
+	TSharedPtr<IMotionProvider> Provider = FindProvider(Character->ProviderId);
 	if (!Provider.IsValid())
 	{
-		OnComplete(false, Empty, FString::Printf(TEXT("No provider registered as '%s'."), *ProviderId.ToString()));
+		OnComplete(false, Empty, FString::Printf(TEXT("No provider registered as '%s'."),
+			*ResolveProviderId(Character->ProviderId).ToString()));
 		return;
 	}
 
 	if (!Provider->SupportsCharacterManagement())
 	{
 		OnComplete(false, Empty, FString::Printf(
-			TEXT("%s cannot upload characters. Export the FBX and add it through their web UI, then "
-				 "paste the id into ProviderCharacterId."),
+			TEXT("%s does not take uploaded characters. It generates on its own rig."),
 			*Provider->GetDisplayName()));
 		return;
 	}
@@ -506,7 +703,7 @@ void UMotionForgeSubsystem::UploadCharacter(
 	if (!Provider->HasCredential())
 	{
 		OnComplete(false, Empty, FString::Printf(
-			TEXT("No API key for %s. Set one in Project Settings > Plugins > MotionForge."),
+			TEXT("No API key for %s. Add it on the Keys page, or in Editor Preferences."),
 			*Provider->GetDisplayName()));
 		return;
 	}
@@ -522,9 +719,10 @@ void UMotionForgeSubsystem::UploadCharacter(
 	// Weak, not raw: the upload takes up to five minutes and the asset can be garbage collected or
 	// the editor closed in that window.
 	TWeakObjectPtr<UMotionCharacter> WeakCharacter = Character;
+	const FName ProviderId = Provider->GetProviderId();
 
 	Provider->UploadCharacter(FbxPath, Character->GetDisplayName(), Options,
-		[WeakCharacter, FbxPath, OnComplete](const FMotionCharacterUploadResult& Upload)
+		[WeakCharacter, FbxPath, ProviderId, OnComplete](const FMotionCharacterUploadResult& Upload)
 		{
 			const FMotionCharacterUpload Nothing;
 
@@ -540,13 +738,21 @@ void UMotionForgeSubsystem::UploadCharacter(
 				// The character was created provider-side, so say the id rather than losing it.
 				OnComplete(false, Nothing, FString::Printf(
 					TEXT("Upload succeeded as character '%s', but the asset went away before the id "
-						 "could be written. Paste it into ProviderCharacterId by hand."),
+						 "could be written. Paste it into Provider Character Id by hand."),
 					*Upload.CharacterId));
 				return;
 			}
 
 			Live->ProviderCharacterId = Upload.CharacterId;
 			Live->SourceFbxPath = FbxPath;
+
+			// An uploaded character belongs to the provider it was uploaded to - its id means nothing
+			// anywhere else - so it stops being universal.
+			if (Live->ProviderId.IsNone())
+			{
+				Live->ProviderId = ProviderId;
+			}
+
 			Live->MarkPackageDirty();
 			SaveAsset(Live);
 
@@ -567,12 +773,10 @@ void UMotionForgeSubsystem::ListProviderCharacters(
 	FName ProviderId,
 	TFunction<void(bool, const TArray<FMotionRemoteCharacter>&, const FString&)> OnComplete)
 {
-	const FName Resolved = ProviderId.IsNone() ? UMotionForgeSettings::Get()->DefaultProviderId : ProviderId;
-
-	TSharedPtr<IMotionProvider> Provider = FindProvider(Resolved);
+	TSharedPtr<IMotionProvider> Provider = FindProvider(ProviderId);
 	if (!Provider.IsValid())
 	{
-		OnComplete(false, {}, FString::Printf(TEXT("No provider registered as '%s'."), *Resolved.ToString()));
+		OnComplete(false, {}, FString::Printf(TEXT("No provider registered as '%s'."), *ResolveProviderId(ProviderId).ToString()));
 		return;
 	}
 
@@ -622,7 +826,9 @@ FString UMotionForgeSubsystem::SubmitBatchFromJson(const FString& Json)
 		return MotionForgeJson::Error(TEXT("Payload was not valid JSON."));
 	}
 
-	EMotionPipelineMode Mode = UMotionForgeSettings::Get()->DefaultMode;
+	// Stopping for review unless the payload asks otherwise. An unattended run spends without anyone
+	// looking, so it has to be asked for by name.
+	EMotionPipelineMode Mode = EMotionPipelineMode::HumanInTheLoop;
 	FString ModeText;
 	if (Root->TryGetStringField(TEXT("mode"), ModeText) && ModeText.Equals(TEXT("Automatic"), ESearchCase::IgnoreCase))
 	{
@@ -669,6 +875,15 @@ FString UMotionForgeSubsystem::SubmitBatchFromJson(const FString& Json)
 			Spec.ProviderId = FName(*ProviderText);
 		}
 
+		const TSharedPtr<FJsonObject>* Options = nullptr;
+		if ((*Entry)->TryGetObjectField(TEXT("pipelineOptions"), Options) && Options)
+		{
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*Options)->Values)
+			{
+				Spec.PipelineOptions.Add(Pair.Key, Pair.Value->AsString());
+			}
+		}
+
 		Specs.Add(MoveTemp(Spec));
 	}
 
@@ -689,81 +904,1036 @@ FString UMotionForgeSubsystem::SubmitBatchFromJson(const FString& Json)
 }
 
 // -------------------------------------------------------------------------------------------------
-// Pipeline
+// Characters and providers
 // -------------------------------------------------------------------------------------------------
 
-bool UMotionForgeSubsystem::ResolveDefinition(
-	UMotionDef* Def,
-	TSharedPtr<IMotionProvider>& OutProvider,
-	UMotionCharacter*& OutCharacter,
-	FString& OutError,
-	EMotionBlocker* OutBlocker) const
+bool UMotionForgeSubsystem::DoesCharacterSuit(
+	const UMotionCharacter* Character, FName ProviderId, FString* OutReason, EMotionBlocker* OutBlocker) const
 {
-	if (OutBlocker) { *OutBlocker = EMotionBlocker::None; }
+	FString Reason;
+	EMotionBlocker Blocker = EMotionBlocker::None;
 
-	const UMotionForgeSettings* Settings = UMotionForgeSettings::Get();
-
-	const FName ProviderId = Def->ProviderId.IsNone() ? Settings->DefaultProviderId : Def->ProviderId;
-	OutProvider = FindProvider(ProviderId);
-	if (!OutProvider.IsValid())
+	auto Fail = [&](EMotionBlocker B, const FString& Why)
 	{
-		OutError = FString::Printf(TEXT("No provider registered as '%s'."), *ProviderId.ToString());
-		if (OutBlocker) { *OutBlocker = EMotionBlocker::NoProvider; }
+		if (OutReason)  { *OutReason = Why; }
+		if (OutBlocker) { *OutBlocker = B; }
+		return false;
+	};
+
+	if (Character == nullptr)
+	{
+		return Fail(EMotionBlocker::NoCharacter, TEXT("No Motion Character."));
+	}
+
+	const FName Resolved = ResolveProviderId(ProviderId);
+	TSharedPtr<IMotionProvider> Provider = FindProvider(Resolved);
+
+	// A character naming another provider belongs to it: its rig, its uploaded id and its retargeter
+	// were all made for that provider. Nothing else about it can make it suit this one.
+	if (!Character->ProviderId.IsNone() && Character->ProviderId != Resolved)
+	{
+		TSharedPtr<IMotionProvider> Owner = FindProvider(Character->ProviderId);
+		return Fail(EMotionBlocker::CharacterForOtherProvider, FString::Printf(
+			TEXT("'%s' is prepared for %s, not %s."),
+			*Character->GetDisplayName(),
+			Owner.IsValid() ? *Owner->GetDisplayName() : *Character->ProviderId.ToString(),
+			Provider.IsValid() ? *Provider->GetDisplayName() : *Resolved.ToString()));
+	}
+
+	if (!Provider.IsValid())
+	{
+		return Fail(EMotionBlocker::NoProvider, FString::Printf(TEXT("No provider registered as '%s'."), *Resolved.ToString()));
+	}
+
+	if (!Character->IsUsable(Reason))
+	{
+		return Fail(EMotionBlocker::CharacterUnusable, FString::Printf(TEXT("'%s': %s"), *Character->GetDisplayName(), *Reason));
+	}
+
+	if (!Provider->CheckCharacter(Character, Reason, Blocker))
+	{
+		return Fail(Blocker == EMotionBlocker::None ? EMotionBlocker::CharacterUnusable : Blocker, Reason);
+	}
+
+	if (OutReason)  { OutReason->Reset(); }
+	if (OutBlocker) { *OutBlocker = EMotionBlocker::None; }
+	return true;
+}
+
+TArray<FString> UMotionForgeSubsystem::FindCharactersFor(FName ProviderId) const
+{
+	const FName Resolved = ResolveProviderId(ProviderId);
+
+	const FAssetRegistryModule& Registry =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+
+	TArray<FAssetData> Assets;
+	Registry.Get().GetAssetsByClass(UMotionCharacter::StaticClass()->GetClassPathName(), Assets, true);
+
+	TArray<FString> Prepared;
+	TArray<FString> Universal;
+
+	for (const FAssetData& Asset : Assets)
+	{
+		const UMotionCharacter* Character = Cast<UMotionCharacter>(Asset.GetAsset());
+		if (!DoesCharacterSuit(Character, Resolved))
+		{
+			continue;
+		}
+
+		(Character->ProviderId == Resolved ? Prepared : Universal).Add(Asset.GetSoftObjectPath().ToString());
+	}
+
+	Prepared.Sort();
+	Universal.Sort();
+	Prepared.Append(Universal);
+	return Prepared;
+}
+
+FString UMotionForgeSubsystem::PickCharacterFor(const UMotionDef* Def, FName ProviderId) const
+{
+	const FName Resolved = ResolveProviderId(ProviderId);
+
+	auto Suits = [this, Resolved](const FSoftObjectPath& Path)
+	{
+		if (Path.IsNull())
+		{
+			return false;
+		}
+		return DoesCharacterSuit(Cast<UMotionCharacter>(Path.TryLoad()), Resolved);
+	};
+
+	if (Def)
+	{
+		// The one this definition last used with this provider - switching back gives it back.
+		if (const TSoftObjectPtr<UMotionCharacter>* Remembered = Def->CharacterByProvider.Find(Resolved))
+		{
+			if (Suits(Remembered->ToSoftObjectPath()))
+			{
+				return Remembered->ToString();
+			}
+		}
+
+		if (Suits(Def->Character.ToSoftObjectPath()))
+		{
+			return Def->Character.ToString();
+		}
+
+		// The character its most recent take on this provider was made for.
+		for (int32 Index = Def->Candidates.Num() - 1; Index >= 0; --Index)
+		{
+			const FMotionCandidate& Take = Def->Candidates[Index];
+			if (Take.ProviderId == Resolved && Suits(Take.Character))
+			{
+				return Take.Character.ToString();
+			}
+		}
+	}
+
+	const FSoftObjectPath Default = UMotionForgeSettings::Get()->DefaultCharacter.ToSoftObjectPath();
+	if (Suits(Default))
+	{
+		return Default.ToString();
+	}
+
+	const TArray<FString> Candidates = FindCharactersFor(Resolved);
+	if (Candidates.Num() > 0)
+	{
+		return Candidates[0];
+	}
+
+	// Nothing passes every check - but a character prepared for this provider that needs one fix is
+	// still the right character, and "none is prepared" would be false. Picked, and the caller says
+	// what it needs.
+	const FAssetRegistryModule& Registry =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+
+	TArray<FAssetData> Assets;
+	Registry.Get().GetAssetsByClass(UMotionCharacter::StaticClass()->GetClassPathName(), Assets, true);
+	Assets.Sort([](const FAssetData& A, const FAssetData& B) { return A.AssetName.LexicalLess(B.AssetName); });
+
+	for (const FAssetData& Asset : Assets)
+	{
+		const UMotionCharacter* Character = Cast<UMotionCharacter>(Asset.GetAsset());
+		if (Character && Character->ProviderId == Resolved)
+		{
+			return Asset.GetSoftObjectPath().ToString();
+		}
+	}
+
+	return FString();
+}
+
+FString UMotionForgeSubsystem::CreateCharacterFromMesh(const FString& SkeletalMeshPath, FString& OutError)
+{
+	USkeletalMesh* Mesh = LoadObject<USkeletalMesh>(nullptr, *SkeletalMeshPath);
+	if (!Mesh)
+	{
+		OutError = FString::Printf(TEXT("No skeletal mesh at '%s'."), *SkeletalMeshPath);
+		return FString();
+	}
+
+	if (!Mesh->GetSkeleton())
+	{
+		OutError = FString::Printf(TEXT("'%s' has no skeleton, so nothing could play on it."), *Mesh->GetName());
+		return FString();
+	}
+
+	FString BaseName = Mesh->GetName();
+	BaseName.RemoveFromStart(TEXT("SKM_"));
+	BaseName.RemoveFromStart(TEXT("SK_"));
+
+	const FString AssetName = ObjectTools::SanitizeObjectName(TEXT("MC_") + BaseName);
+	const FString PackagePath = UMotionForgeSettings::Get()->GetCharactersPath() / AssetName;
+
+	if (UMotionCharacter* Existing = LoadObject<UMotionCharacter>(nullptr, *(PackagePath + TEXT(".") + AssetName), nullptr, LOAD_NoWarn | LOAD_Quiet))
+	{
+		OutError.Reset();
+		return Existing->GetPathName();
+	}
+
+	UPackage* Package = CreatePackage(*PackagePath);
+	UMotionCharacter* Character = Package
+		? NewObject<UMotionCharacter>(Package, *AssetName, RF_Public | RF_Standalone | RF_Transactional)
+		: nullptr;
+
+	if (!Character)
+	{
+		OutError = FString::Printf(TEXT("Could not create '%s'."), *PackagePath);
+		return FString();
+	}
+
+	Character->TargetSkeleton = Mesh->GetSkeleton();
+	Character->PreviewMesh = Mesh;
+	Character->DisplayName = BaseName;
+
+	FAssetRegistryModule::AssetCreated(Character);
+	Character->MarkPackageDirty();
+	SaveAsset(Character);
+
+	UE_LOG(LogMotionForge, Log, TEXT("Created Motion Character '%s' from '%s'."), *Character->GetPathName(), *Mesh->GetPathName());
+
+	OutError.Reset();
+	return Character->GetPathName();
+}
+
+bool UMotionForgeSubsystem::ClearCharacterProviderRig(const FString& CharacterPath, FString& OutMessage)
+{
+	UMotionCharacter* Character = LoadObject<UMotionCharacter>(nullptr, *CharacterPath);
+	if (!Character)
+	{
+		OutMessage = FString::Printf(TEXT("No Motion Character at '%s'."), *CharacterPath);
 		return false;
 	}
 
-	const FMotionProviderCaps Caps = OutProvider->GetCaps();
+	// The provider rig and its retargeter decide the retarget route; without them clips import straight
+	// onto the character's own skeleton, which is right for a character the provider generates on.
+	// The rig assets stay in the project, so this is undone by setting them again.
+	Character->Modify();
+	Character->ProviderMesh.Reset();
+	Character->Retargeter.Reset();
+	Character->MarkPackageDirty();
+	SaveAsset(Character);
 
-	// A local provider has nothing to sign in to. Demanding a key it does not have would make the
-	// free path unusable in exactly the case it exists for.
-	if (Caps.bNeedsCredential && !OutProvider->HasCredential())
+	OutMessage = FString::Printf(TEXT("'%s' now imports clips directly onto %s."),
+		*Character->GetDisplayName(), *Character->TargetSkeleton.ToSoftObjectPath().GetAssetName());
+
+	for (const FName Id : GetProviderIds())
 	{
-		// Keys moved to Editor Preferences, and there is a Keys page now. The old sentence sent
-		// people to a settings page that no longer holds them.
-		OutError = FString::Printf(
-			TEXT("No API key for %s. Set one on the Keys page, or in Editor Preferences."),
-			*OutProvider->GetDisplayName());
-		if (OutBlocker) { *OutBlocker = EMotionBlocker::NoCredential; }
+		NotifyProviderStateChanged(Id);
+	}
+	return true;
+}
+
+FString UMotionForgeSubsystem::OnDefinitionProviderChanged(UMotionDef* Def)
+{
+	if (Def == nullptr)
+	{
+		return FString();
+	}
+
+	const FName Provider = Def->GetResolvedProviderId();
+	TSharedPtr<IMotionProvider> ProviderPtr = FindProvider(Provider);
+	const FString ProviderName = ProviderPtr.IsValid() ? ProviderPtr->GetDisplayName() : Provider.ToString();
+
+	// Its settings, created with the provider's defaults on first use and kept from before otherwise.
+	Def->GetOrCreatePipeline(Provider);
+
+	FString Message;
+
+	UMotionCharacter* Current = Def->Character.LoadSynchronous();
+	if (Current && DoesCharacterSuit(Current, Provider))
+	{
+		Message = FString::Printf(TEXT("%s suits %s, so it stays."), *Current->GetDisplayName(), *ProviderName);
+	}
+	else
+	{
+		const FString Picked = PickCharacterFor(Def, Provider);
+		if (!Picked.IsEmpty())
+		{
+			Def->Character = TSoftObjectPtr<UMotionCharacter>(FSoftObjectPath(Picked));
+			const UMotionCharacter* Now = Def->Character.LoadSynchronous();
+			const FString Name = Now ? Now->GetDisplayName() : FSoftObjectPath(Picked).GetAssetName();
+
+			FString Why;
+			Message = DoesCharacterSuit(Now, Provider, &Why)
+				? FString::Printf(TEXT("Switched the character to %s, which suits %s."), *Name, *ProviderName)
+				: FString::Printf(TEXT("Switched the character to %s, prepared for %s. It needs a fix first: %s"),
+					*Name, *ProviderName, *Why);
+		}
+		else
+		{
+			// Left as it was rather than cleared: nothing generates until a suitable one is chosen, and
+			// the Character card lists how to make one.
+			Message = FString::Printf(TEXT("No character is prepared for %s yet. Create one in the Character card."),
+				*ProviderName);
+		}
+	}
+
+	if (!Def->Character.IsNull())
+	{
+		Def->CharacterByProvider.Add(Provider, Def->Character);
+	}
+
+	Def->MarkPackageDirty();
+	return Message;
+}
+
+FString UMotionForgeSubsystem::SetDefinitionProvider(const FString& AssetPath, FName ProviderId)
+{
+	UMotionDef* Def = LoadDef(AssetPath);
+	if (!Def)
+	{
+		return FString::Printf(TEXT("No motion definition at '%s'."), *AssetPath);
+	}
+
+	if (Def->IsBusy())
+	{
+		return TEXT("It is still working. Wait for it, or cancel, before switching provider.");
+	}
+
+	Def->Modify();
+
+	// Remember who it used with the provider it is leaving, so coming back finds them again.
+	if (!Def->Character.IsNull())
+	{
+		Def->CharacterByProvider.Add(Def->GetResolvedProviderId(), Def->Character);
+	}
+
+	Def->ProviderId = ProviderId;
+	const FString Message = OnDefinitionProviderChanged(Def);
+	SaveAsset(Def);
+	return Message;
+}
+
+TArray<FMotionPipelineOption> UMotionForgeSubsystem::GetPipelineOptions(const FString& AssetPath, FName ProviderId) const
+{
+	const UMotionDef* Def = LoadDef(AssetPath);
+	if (!Def)
+	{
+		return {};
+	}
+
+	const FName Resolved = ProviderId.IsNone() ? Def->GetResolvedProviderId() : ProviderId;
+	const UMotionPipeline* Pipeline = Def->GetPipelineForRead(Resolved);
+	return Pipeline ? Pipeline->DescribeOptions() : TArray<FMotionPipelineOption>();
+}
+
+bool UMotionForgeSubsystem::SetPipelineOption(const FString& AssetPath, const FString& Key, const FString& Value, FString& OutError)
+{
+	UMotionDef* Def = LoadDef(AssetPath);
+	if (!Def)
+	{
+		OutError = FString::Printf(TEXT("No motion definition at '%s'."), *AssetPath);
 		return false;
+	}
+
+	UMotionPipeline* Pipeline = Def->GetOrCreatePipeline(Def->GetResolvedProviderId());
+	if (!Pipeline)
+	{
+		OutError = FString::Printf(TEXT("%s declares no settings."), *Def->GetResolvedProviderId().ToString());
+		return false;
+	}
+
+	Def->Modify();
+	const bool bOk = Key.Equals(TEXT("model"), ESearchCase::IgnoreCase)
+		? Pipeline->SetModelId(Value, OutError)
+		: Pipeline->SetOption(Key, Value, OutError);
+
+	if (bOk)
+	{
+		Def->MarkPackageDirty();
+		SaveAsset(Def);
+	}
+	return bOk;
+}
+
+int32 UMotionForgeSubsystem::MigrateDefinitions()
+{
+	int32 Saved = 0;
+
+	for (const FString& Path : FindMotionDefs({}))
+	{
+		UMotionDef* Def = LoadDef(Path);
+		if (!Def)
+		{
+			continue;
+		}
+
+		const bool bMoved = Def->bMigratedOnLoad | Def->MigrateLegacySettings();
+		if (!bMoved)
+		{
+			continue;
+		}
+
+		Def->bMigratedOnLoad = false;
+		Def->MarkPackageDirty();
+		SaveAsset(Def);
+		++Saved;
+	}
+
+	UE_LOG(LogMotionForge, Log, TEXT("Resaved %d definition(s) with their settings in provider pipelines."), Saved);
+	return Saved;
+}
+
+// -------------------------------------------------------------------------------------------------
+// The resolver
+// -------------------------------------------------------------------------------------------------
+
+bool UMotionForgeSubsystem::ResolveInternal(
+	UMotionDef* Def,
+	FMotionResolvedRequest& Out,
+	TArray<FMotionSubmitRequest>* OutRequests,
+	bool bForSubmit,
+	TSharedPtr<IMotionProvider>* OutProvider,
+	UMotionCharacter** OutCharacter) const
+{
+	Out = FMotionResolvedRequest();
+	Out.AssetPath = Def->GetPathName();
+
+	FMotionReadiness& Readiness = Out.Readiness;
+
+	// The first blocker wins and is what the window offers to fix; later ones would only compete with it.
+	auto Block = [&Readiness](EMotionBlocker Blocker, const FString& Problem, const FString& Fix = FString())
+	{
+		if (Readiness.Blocker == EMotionBlocker::None || Readiness.Blocker == EMotionBlocker::ProviderStartable)
+		{
+			Readiness.Blocker = Blocker;
+			Readiness.Problem = Problem;
+			Readiness.FixLabel = Fix;
+		}
+	};
+
+	Def->MigrateLegacySettings();
+
+	// --- provider ---------------------------------------------------------------------------------
+
+	Out.bProviderInherited = Def->ProviderId.IsNone();
+	Out.ProviderId = ResolveProviderId(Def->ProviderId);
+
+	TSharedPtr<IMotionProvider> Provider = FindProvider(Out.ProviderId);
+	if (OutProvider)
+	{
+		*OutProvider = Provider;
+	}
+
+	if (!Provider.IsValid())
+	{
+		Block(EMotionBlocker::NoProvider, Out.ProviderId.IsNone()
+			? FString(TEXT("Choose a provider in the Generate card. Several are installed and none is the project default."))
+			: FString::Printf(TEXT("No provider '%s' is installed."), *Out.ProviderId.ToString()));
+		Readiness.bCanGenerate = false;
+		return false;
+	}
+
+	const FMotionProviderCaps Caps = Provider->GetCaps();
+	Out.ProviderDisplayName = Provider->GetDisplayName();
+
+	if (Def->IsBusy())
+	{
+		Block(EMotionBlocker::Busy, TEXT("It is already working. Wait for it, or cancel it."));
+	}
+
+	if (Caps.bNeedsCredential && !Provider->HasCredential())
+	{
+		Block(EMotionBlocker::NoCredential,
+			FString::Printf(TEXT("%s needs an API key. Add it on the Keys page."), *Out.ProviderDisplayName),
+			TEXT("Open Keys"));
 	}
 
 	if (!Caps.SetupHint.IsEmpty())
 	{
-		OutError = FString::Printf(TEXT("%s is not ready: %s"), *OutProvider->GetDisplayName(), *Caps.SetupHint);
-		if (OutBlocker) { *OutBlocker = EMotionBlocker::ProviderNotReady; }
-		return false;
+		if (!Caps.PrepareLabel.IsEmpty())
+		{
+			// Not a refusal. Generate starts it first; the label says so on the button.
+			if (Readiness.Blocker == EMotionBlocker::None)
+			{
+				Readiness.Blocker = EMotionBlocker::ProviderStartable;
+				Readiness.Problem = Caps.SetupHint;
+				Readiness.FixLabel = Caps.PrepareLabel;
+			}
+		}
+		else
+		{
+			const FText Surface = Provider->GetSetupSurfaceLabel();
+			Block(EMotionBlocker::ProviderNotReady,
+				FString::Printf(TEXT("%s is not ready: %s"), *Out.ProviderDisplayName, *Caps.SetupHint),
+				Surface.IsEmpty() ? FString() : FString::Printf(TEXT("Open %s"), *Surface.ToString()));
+		}
 	}
 
-	TSoftObjectPtr<UMotionCharacter> CharacterPtr = Def->Character.IsNull() ? Settings->DefaultCharacter : Def->Character;
-	OutCharacter = CharacterPtr.LoadSynchronous();
-	if (!OutCharacter)
+	// --- character --------------------------------------------------------------------------------
+
+	UMotionCharacter* Character = Def->Character.LoadSynchronous();
+	if (OutCharacter)
 	{
-		OutError = TEXT("No Motion Character set, and no default configured in settings.");
-		if (OutBlocker) { *OutBlocker = EMotionBlocker::NoCharacter; }
-		return false;
+		*OutCharacter = Character;
 	}
 
-	FString CharacterReason;
-	if (!OutCharacter->IsUsableForProvider(Caps.bSupportsCharacterUpload, CharacterReason))
+	if (Character == nullptr)
 	{
-		OutError = FString::Printf(TEXT("Character '%s' is not usable with %s: %s"),
-			*OutCharacter->GetDisplayName(), *OutProvider->GetDisplayName(), *CharacterReason);
-		if (OutBlocker) { *OutBlocker = EMotionBlocker::CharacterUnusable; }
-		return false;
+		const TArray<FString> Suitable = FindCharactersFor(Out.ProviderId);
+		Block(EMotionBlocker::NoCharacter, Suitable.Num() > 0
+			? FString::Printf(TEXT("Choose a character. %s suits %s."),
+				*FSoftObjectPath(Suitable[0]).GetAssetName(), *Out.ProviderDisplayName)
+			: FString::Printf(TEXT("No character is prepared for %s yet. Create one in the Character card."),
+				*Out.ProviderDisplayName));
+	}
+	else
+	{
+		Out.CharacterPath = Character->GetPathName();
+		Out.CharacterName = Character->GetDisplayName();
+		Out.CharacterRoute = Provider->DescribeCharacterRoute(Character);
+
+		FString Why;
+		EMotionBlocker Blocker = EMotionBlocker::None;
+		if (!DoesCharacterSuit(Character, Out.ProviderId, &Why, &Blocker))
+		{
+			if (Blocker == EMotionBlocker::CharacterForOtherProvider)
+			{
+				const TArray<FString> Suitable = FindCharactersFor(Out.ProviderId);
+				Why += Suitable.Num() > 0
+					? FString::Printf(TEXT(" Choose %s instead."), *FSoftObjectPath(Suitable[0]).GetAssetName())
+					: FString::Printf(TEXT(" No character is prepared for %s yet."), *Out.ProviderDisplayName);
+			}
+			Block(Blocker, Why);
+		}
 	}
 
-	// A definition whose prompt lives on a timeline is allowed an empty field here, because the field
-	// is no longer where the prompt is. Refusing it would be a confidently wrong error message about
-	// the one thing the artist did fill in.
-	if (Def->Prompt.IsEmpty() && FMotionPromptSequence::FindTrack(Def->Control.ConstraintSequence.LoadSynchronous()) == nullptr)
+	// --- prompt -----------------------------------------------------------------------------------
+
+	const int32 FrameRate = FMath::Max(1, Caps.NativeFrameRate);
+
+	FMotionPromptRead Beats;
+	FString PromptError;
+	if (!FMotionPromptSequence::Resolve(Def, FrameRate, Beats, PromptError))
 	{
-		OutError = TEXT("Prompt is empty.");
-		if (OutBlocker) { *OutBlocker = EMotionBlocker::NoPrompt; }
-		return false;
+		Block(EMotionBlocker::InvalidRequest, PromptError);
+	}
+
+	Out.bPromptFromTimeline = Beats.bFromSequence;
+	Out.TimelinePath = Beats.SequencePath;
+	Out.Prompt = Beats.Prompt;
+
+	for (const FString& Problem : Beats.Problems)
+	{
+		Readiness.Warnings.Add(Problem);
+	}
+
+	if (Out.Prompt.TrimStartAndEnd().IsEmpty())
+	{
+		Block(EMotionBlocker::NoPrompt, Beats.bFromSequence
+			? FString(TEXT("The prompt timeline has no beats with text."))
+			: FString(TEXT("Write a prompt: who moves, what they do, and how it ends.")));
+	}
+
+	// --- the base request and the provider's settings ---------------------------------------------
+
+	FMotionSubmitRequest Base;
+	Base.Prompt = Out.Prompt;
+	Base.ProviderCharacterId = Character ? Character->ProviderCharacterId : FString();
+	Base.Definition = Def;
+
+	// The authored half only: poses, the timeline, beat seconds. The sampler half is the pipeline's.
+	Base.Control.Constraints = Def->Control.Constraints;
+	Base.Control.ConstraintSequence = Def->Control.ConstraintSequence;
+	Base.Control.ConstraintSequenceType = Def->Control.ConstraintSequenceType;
+
+	const UMotionPipeline* Pipeline = Def->GetPipelineForRead(Out.ProviderId);
+	if (Pipeline)
+	{
+		Pipeline->Apply(Base);
+	}
+
+	Base.ModelId = Base.ModelId.IsEmpty() ? Provider->GetDefaultModelId() : Base.ModelId;
+	Out.ModelId = Base.ModelId;
+
+	// --- length and beats -------------------------------------------------------------------------
+
+	const FMotionPromptSplitting Splitting = Provider->GetPromptSplitting();
+
+	float ModelMin = 1.f;
+	float ModelMax = Splitting.MaxTotalSeconds;
+	{
+		const TArray<FMotionModelInfo> Models = Provider->GetModels();
+		const FMotionModelInfo* Model = Models.FindByPredicate(
+			[&Out](const FMotionModelInfo& M) { return M.Id == Out.ModelId; });
+
+		if (Model)
+		{
+			ModelMin = Model->MinSeconds;
+			ModelMax = Model->MaxSeconds;
+		}
+		else
+		{
+			int32 Min = 1;
+			int32 Max = 10;
+			Provider->GetLengthRange(Out.ModelId, Min, Max);
+			ModelMin = Min;
+			ModelMax = Max;
+
+			if (Models.Num() > 0)
+			{
+				Block(EMotionBlocker::InvalidRequest, FString::Printf(
+					TEXT("%s does not offer the model '%s'. Pick one in the Generate card."),
+					*Out.ProviderDisplayName, *Out.ModelId));
+			}
+		}
+	}
+
+	Out.bSplitIntoBeats = Splitting.bSplitsAtFullStops && Base.Control.bSplitPromptIntoBeats;
+
+	// The seconds per beat, from wherever they were stated. A timeline states them for every beat; a
+	// definition only when somebody filled them in.
+	TArray<float> BeatSeconds;
+	if (Beats.bFromSequence)
+	{
+		for (const FMotionPromptBeat& Beat : Beats.Beats)
+		{
+			BeatSeconds.Add(Beat.Seconds);
+		}
+	}
+	else
+	{
+		BeatSeconds = Def->Control.BeatSeconds;
+	}
+
+	float Length = Def->Length;
+
+	if (Out.bSplitIntoBeats)
+	{
+		const TArray<FString> Sentences = MotionForgePrompt::Split(Out.Prompt);
+		Out.BeatCount = FMath::Max(1, Sentences.Num());
+
+		if (BeatSeconds.Num() > 0 && BeatSeconds.Num() != Out.BeatCount)
+		{
+			Block(EMotionBlocker::InvalidRequest, FString::Printf(
+				TEXT("%d beat durations for a prompt %s divides into %d beats. Every full stop starts a beat; "
+					 "match the durations to the sentences, or clear them to share the length evenly."),
+				BeatSeconds.Num(), *Out.ProviderDisplayName, Out.BeatCount));
+		}
+
+		if (BeatSeconds.Num() != Out.BeatCount)
+		{
+			// Shared evenly by the provider, on whole frames. Worked out here the same way, so the beat
+			// strip shows what will actually be generated.
+			BeatSeconds.Reset();
+			const int32 TotalFrames = FMath::Max(Out.BeatCount, FMath::RoundToInt(Length * FrameRate));
+			const int32 PerBeat = TotalFrames / Out.BeatCount;
+			const int32 Remainder = TotalFrames % Out.BeatCount;
+			for (int32 Index = 0; Index < Out.BeatCount; ++Index)
+			{
+				BeatSeconds.Add(static_cast<float>(PerBeat + (Index < Remainder ? 1 : 0)) / FrameRate);
+			}
+			Base.Control.BeatSeconds.Reset();
+		}
+		else
+		{
+			Base.Control.BeatSeconds = BeatSeconds;
+
+			float Sum = 0.f;
+			for (const float Seconds : BeatSeconds)
+			{
+				Sum += Seconds;
+			}
+
+			if (!FMath::IsNearlyEqual(Sum, static_cast<float>(Def->Length), 0.05f))
+			{
+				Out.LengthNote = FString::Printf(TEXT("%s from the beats, not the %d s length."),
+					*MotionForgeCost::Seconds(Sum), Def->Length);
+			}
+			Length = Sum;
+		}
+
+		float Start = 0.f;
+		for (int32 Index = 0; Index < BeatSeconds.Num(); ++Index)
+		{
+			FMotionPromptBeat Beat;
+			Beat.Text = Sentences.IsValidIndex(Index) ? Sentences[Index] : FString();
+			Beat.Seconds = BeatSeconds[Index];
+			Beat.StartSeconds = Start;
+			Beat.StartFrame = FMath::RoundToInt(Start * FrameRate);
+			Beat.Frames = FMath::RoundToInt(Beat.Seconds * FrameRate);
+			Start += Beat.Seconds;
+			Out.Beats.Add(Beat);
+
+			if (Beat.Seconds > Splitting.MaxBeatSeconds + 0.01f)
+			{
+				Block(EMotionBlocker::LengthOutOfRange, FString::Printf(
+					TEXT("Beat %d is %s. %s's limit is %s a beat; longer ones fall apart. Add a full stop "
+						 "to split it, or shorten it."),
+					Index + 1, *MotionForgeCost::Seconds(Beat.Seconds), *Out.ProviderDisplayName,
+					*MotionForgeCost::Seconds(Splitting.MaxBeatSeconds)));
+			}
+			else if (Beat.Seconds < 0.1f)
+			{
+				Block(EMotionBlocker::LengthOutOfRange, FString::Printf(
+					TEXT("Beat %d is too short to perform (%s)."), Index + 1, *MotionForgeCost::Seconds(Beat.Seconds)));
+			}
+		}
+
+		if (Length > Splitting.MaxTotalSeconds + 0.01f)
+		{
+			Block(EMotionBlocker::LengthOutOfRange, FString::Printf(
+				TEXT("The clip would be %s; %s makes at most %s in one take."),
+				*MotionForgeCost::Seconds(Length), *Out.ProviderDisplayName,
+				*MotionForgeCost::Seconds(Splitting.MaxTotalSeconds)));
+		}
+
+		// A decimal point is a beat boundary to a splitting provider. It is legal and almost never meant.
+		const FString Decimal = MotionForgePrompt::FindDecimal(Out.Prompt);
+		if (!Decimal.IsEmpty())
+		{
+			Readiness.Warnings.Add(FString::Printf(
+				TEXT("\"%s\" will split a beat at its decimal point. Write the number in words."), *Decimal));
+		}
+	}
+	else
+	{
+		Out.BeatCount = 1;
+
+		// Beat seconds mean nothing to one generation of the whole prompt. A timeline still states the
+		// length, as the sum of its beats; a definition's own beat seconds are ignored rather than
+		// quietly summed into a length nobody asked for.
+		Base.Control.BeatSeconds.Reset();
+
+		if (Beats.bFromSequence && Beats.TotalSeconds > 0.f)
+		{
+			Length = Beats.TotalSeconds;
+			Out.LengthNote = FString::Printf(TEXT("%s from the timeline."), *MotionForgeCost::Seconds(Length));
+		}
+
+		// One beat on a provider that splits, when splitting is off, is limited like any beat.
+		const float Max = Splitting.bSplitsAtFullStops ? FMath::Min(ModelMax, Splitting.MaxBeatSeconds) : ModelMax;
+
+		if (Length < ModelMin)
+		{
+			Out.LengthNote = FString::Printf(
+				TEXT("Raised to %s, %s's shortest clip. The model pads a shorter action out to fill it; trim it on import."),
+				*MotionForgeCost::Seconds(ModelMin), *Out.ProviderDisplayName);
+			Length = ModelMin;
+		}
+		else if (Length > Max)
+		{
+			Out.LengthNote = FString::Printf(TEXT("Cut to %s, the longest %s makes in one piece."),
+				*MotionForgeCost::Seconds(Max), *Out.ProviderDisplayName);
+			Length = Max;
+		}
+
+		if (!Out.Prompt.IsEmpty())
+		{
+			FMotionPromptBeat Whole;
+			Whole.Text = Out.Prompt;
+			Whole.Seconds = Length;
+			Whole.Frames = FMath::RoundToInt(Length * FrameRate);
+			Out.Beats.Add(Whole);
+		}
+	}
+
+	Out.LengthSeconds = Length;
+	Base.LengthSeconds = Length;
+	Base.Length = FMath::Max(1, FMath::RoundToInt(Length));
+
+	// --- the provider's own checks, and the core's warnings ----------------------------------------
+
+	if (Pipeline)
+	{
+		TArray<FString> Problems;
+		Pipeline->Validate(Base, Problems, Readiness.Warnings);
+		if (Problems.Num() > 0)
+		{
+			Block(EMotionBlocker::InvalidRequest, Problems[0]);
+		}
+
+		Out.Settings = Pipeline->DescribeSent(Base);
+	}
+
+	const int32 AuthoredKeys = Def->Control.CountAuthoredKeys();
+	if (Caps.ConstraintTypes.Num() == 0)
+	{
+		if (AuthoredKeys > 0)
+		{
+			Readiness.Warnings.Add(FString::Printf(
+				TEXT("This definition has %d constraint pose(s). %s does not take constraints, so they are not sent."),
+				AuthoredKeys, *Out.ProviderDisplayName));
+		}
+	}
+	else
+	{
+		switch (Base.Control.ConstraintSource)
+		{
+		case EMotionConstraintSource::None:
+			Out.Constraints = TEXT("None: the prompt alone decides the motion.");
+			break;
+
+		case EMotionConstraintSource::Authored:
+			Out.Constraints = AuthoredKeys > 0
+				? FString::Printf(TEXT("%d authored pose key(s)."), AuthoredKeys)
+				: TEXT("None authored.");
+			break;
+
+		case EMotionConstraintSource::Timeline:
+			Out.Constraints = Def->Control.ConstraintSequence.IsNull()
+				? TEXT("Timeline only, and there is no prompt timeline: nothing is sent.")
+				: TEXT("The poses keyed on the prompt timeline, read when you generate.");
+			break;
+
+		default:
+			Out.Constraints = !Def->Control.ConstraintSequence.IsNull()
+				? (AuthoredKeys > 0
+					? FString::Printf(TEXT("The poses keyed on the prompt timeline; if none are keyed there, the %d authored key(s)."), AuthoredKeys)
+					: TEXT("The poses keyed on the prompt timeline, read when you generate."))
+				: (AuthoredKeys > 0
+					? FString::Printf(TEXT("%d authored pose key(s)."), AuthoredKeys)
+					: TEXT("None yet. Pose the character on the prompt timeline to pin moments."));
+			break;
+		}
+	}
+
+	// --- takes and seeds --------------------------------------------------------------------------
+
+	Out.Variants = FMath::Clamp(Def->Variants, 1, 16);
+
+	for (int32 Variant = 0; Variant < Out.Variants; ++Variant)
+	{
+		// A fixed seed walks, so several takes from seed 42 are 42, 43, 44 - reproducible and different.
+		Out.Seeds.Add(Caps.bSupportsSeed && Base.Control.Seed >= 0 ? Base.Control.Seed + Variant : -1);
+	}
+
+	// --- money ------------------------------------------------------------------------------------
+
+	PriceRequest(*Provider, Out);
+
+	// --- the recipe, for telling a stale take from a current one -----------------------------------
+
+	{
+		FString Recipe = FString::Printf(TEXT("%s|%s|%s|%s|%.3f|"),
+			*Out.ProviderId.ToString(), *Out.ModelId, *Out.Prompt, *Out.CharacterPath, Out.LengthSeconds);
+
+		for (const FMotionPromptBeat& Beat : Out.Beats)
+		{
+			Recipe += FString::Printf(TEXT("%.3f,"), Beat.Seconds);
+		}
+
+		// Everything in the pipeline except the seed, which differs per take by design.
+		if (Pipeline)
+		{
+			for (const FString& Setting : Out.Settings)
+			{
+				if (!Setting.StartsWith(TEXT("seed=")))
+				{
+					Recipe += Setting + TEXT(";");
+				}
+			}
+		}
+
+		// The authored poses, for a provider that takes them: a pinned hand moved is a different
+		// request, and a take made before it is an older recipe.
+		//
+		// Not the timeline's keys. They are only read at submission, and the timeline's own edit
+		// signature cannot stand in for them: importing a take writes the clip onto that same sequence,
+		// which would make every take look older the moment one was chosen.
+		if (Caps.ConstraintTypes.Num() > 0 && Def->Control.Constraints.Num() > 0)
+		{
+			if (const FProperty* Authored = FMotionControl::StaticStruct()->FindPropertyByName(GET_MEMBER_NAME_CHECKED(FMotionControl, Constraints)))
+			{
+				FString Poses;
+				Authored->ExportTextItem_Direct(Poses, &Def->Control.Constraints, nullptr, nullptr, PPF_None);
+				Recipe += TEXT("|poses:") + Poses;
+			}
+		}
+
+		Out.RecipeHash = FString::Printf(TEXT("%016llx"), CityHash64(
+			reinterpret_cast<const char*>(*Recipe), Recipe.Len() * sizeof(TCHAR)));
+	}
+
+	Out.bCanSubmit = Readiness.Blocker == EMotionBlocker::None || Readiness.Blocker == EMotionBlocker::ProviderStartable;
+	Readiness.bCanGenerate = Out.bCanSubmit;
+
+	if (!Out.bCanSubmit || OutRequests == nullptr)
+	{
+		return Out.bCanSubmit;
+	}
+
+	// --- the requests actually submitted ----------------------------------------------------------
+
+	if (bForSubmit)
+	{
+		Base.TargetSkeleton = Character ? Character->TargetSkeleton.LoadSynchronous() : nullptr;
+
+		TArray<FString> Warnings;
+		Provider->PrepareRequest(Base, Warnings);
+
+		for (const FString& Warning : Warnings)
+		{
+			UE_LOG(LogMotionForge, Warning, TEXT("'%s': %s"), *Def->GetName(), *Warning);
+			Readiness.Warnings.Add(Warning);
+		}
+	}
+
+	for (int32 Variant = 0; Variant < Out.Variants; ++Variant)
+	{
+		FMotionSubmitRequest Request = Base;
+		Request.VariantIndex = Variant;
+
+		if (Caps.bSupportsSeed)
+		{
+			// A random seed is chosen here, not left to the provider, so it can be recorded on the take -
+			// which is what makes every take reproducible, not only the ones somebody seeded by hand.
+			Request.Control.Seed = Base.Control.Seed >= 0
+				? Base.Control.Seed + Variant
+				: FMath::RandRange(1, MAX_int32 - 1);
+			Out.Seeds[Variant] = Request.Control.Seed;
+		}
+
+		OutRequests->Add(MoveTemp(Request));
 	}
 
 	return true;
 }
+
+void UMotionForgeSubsystem::PriceRequest(const IMotionProvider& Provider, FMotionResolvedRequest& Resolved)
+{
+	FMotionCostEstimate& Cost = Resolved.Cost;
+	Cost = FMotionCostEstimate();
+
+	// Billed in whole requested seconds where the provider takes an integer; that is what the invoice
+	// counts, not the length of the file that comes back.
+	const float PerTake = FMath::Max(1, FMath::RoundToInt(Resolved.LengthSeconds));
+
+	AccumulateCost(Cost, Provider.GetBilling(), Provider.GetDisplayName(),
+		Resolved.Variants, PerTake * Resolved.Variants, /*DownloadSeconds*/ 0.f);
+
+	FinishCost(Cost, {});
+}
+
+void UMotionForgeSubsystem::AccumulateCost(
+	FMotionCostEstimate& Estimate,
+	const FMotionBilling& Billing,
+	const FString& ProviderName,
+	int32 Takes,
+	float GeneratedSeconds,
+	float DownloadSeconds)
+{
+	using namespace MotionForgeCost;
+
+	Estimate.Clips += Takes;
+	Estimate.GeneratedSeconds += FMath::CeilToInt(GeneratedSeconds);
+	Estimate.DownloadSeconds += FMath::CeilToInt(DownloadSeconds);
+	Estimate.Currency = Billing.Currency;
+
+	FString Line;
+
+	// A download estimate carries no takes to generate, only seconds to fetch - and is worded as
+	// fetching, never as "0 takes".
+	const bool bFetchOnly = Takes == 0 && GeneratedSeconds <= 0.f;
+
+	switch (Billing.Unit)
+	{
+	case EMotionBillingUnit::Free:
+		Line = bFetchOnly
+			? FString::Printf(TEXT("fetching %s from %s: free."), *Seconds(DownloadSeconds), *ProviderName)
+			: FString::Printf(TEXT("%s on %s: free, %s."), *MotionForgeCost::Takes(Takes), *ProviderName,
+				*Billing.Summary.Replace(TEXT("free, "), TEXT("")).Replace(TEXT("free"), TEXT("nothing is billed")));
+		break;
+
+	case EMotionBillingUnit::PerGeneratedSecond:
+	{
+		const float Money = GeneratedSeconds * Billing.Rate;
+		Estimate.BilledSeconds += FMath::CeilToInt(GeneratedSeconds);
+		Estimate.EstimatedCost += Money;
+		Estimate.BillingModel = EMotionBillingModel::PayPerGeneratedSecond;
+		Estimate.bSpendsMoney |= GeneratedSeconds > 0.f;
+
+		Line = bFetchOnly
+			? FString::Printf(TEXT("fetching %s from %s: free, because %s bills when a take is generated."),
+				*Seconds(DownloadSeconds), *ProviderName, *ProviderName)
+			: Billing.Rate > 0.f
+			? FString::Printf(TEXT("about %s on %s: %s, %s at %s a second%s, billed when submitted whether kept or not."),
+				*MotionForgeCost::Money(Money, Billing.Currency), *ProviderName, *MotionForgeCost::Takes(Takes),
+				*Seconds(Takes > 0 ? GeneratedSeconds / Takes : 0.f), *MotionForgeCost::Money(Billing.Rate, Billing.Currency),
+				Billing.RateNote.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" (%s)"), *Billing.RateNote))
+			: FString::Printf(TEXT("%s on %s: %s billed when submitted. Set the rate on the provider's settings page to see money."),
+				*MotionForgeCost::Takes(Takes), *ProviderName, *Seconds(GeneratedSeconds));
+		break;
+	}
+
+	case EMotionBillingUnit::PerDownloadedSecond:
+	{
+		const float Money = DownloadSeconds * Billing.Rate;
+		Estimate.BilledSeconds += FMath::CeilToInt(DownloadSeconds);
+		Estimate.EstimatedCost += Money;
+		Estimate.BillingModel = EMotionBillingModel::PayPerDownloadedSecond;
+		Estimate.bSpendsMoney |= DownloadSeconds > 0.f;
+
+		Line = DownloadSeconds > 0.f
+			? FString::Printf(TEXT("%s of your %s download quota%s."),
+				*Seconds(DownloadSeconds), *ProviderName,
+				Billing.Rate > 0.f ? *FString::Printf(TEXT(", about %s"), *MotionForgeCost::Money(Money, Billing.Currency)) : TEXT(""))
+			: FString::Printf(TEXT("%s on %s: free to generate on your subscription. Importing a take uses its seconds of your download quota."),
+				*MotionForgeCost::Takes(Takes), *ProviderName);
+		break;
+	}
+
+	case EMotionBillingUnit::PerHour:
+		Estimate.bHourlyBillingNow |= Billing.bBillingNow;
+		Estimate.HourlyRate = FMath::Max(Estimate.HourlyRate, Billing.Rate);
+
+		// A take adds nothing to an hourly bill; the machine being up is what costs. Saying so is the
+		// honest cost line - "free" would be false and a per-take price would be invented.
+		Line = FString::Printf(TEXT("%s: no charge per take. The rented GPU costs %s an hour%s."),
+			bFetchOnly
+				? *FString::Printf(TEXT("fetching %s from %s"), *Seconds(DownloadSeconds), *ProviderName)
+				: *FString::Printf(TEXT("%s on %s"), *MotionForgeCost::Takes(Takes), *ProviderName),
+			Billing.Rate > 0.f ? *MotionForgeCost::Money(Billing.Rate, Billing.Currency) : TEXT("an unknown amount"),
+			Billing.bBillingNow ? TEXT(", billing now whether or not anything generates") : TEXT(" while it runs"));
+		break;
+	}
+
+	// The most expensive unit involved names the estimate, so a mixed selection is never labelled free.
+	if (static_cast<uint8>(Billing.Unit) > static_cast<uint8>(Estimate.Unit) || Estimate.Summary.IsEmpty())
+	{
+		Estimate.Unit = FMath::Max(Estimate.Unit, Billing.Unit);
+	}
+
+	if (!Line.IsEmpty())
+	{
+		Line[0] = FChar::ToUpper(Line[0]);
+		Estimate.Summary += (Estimate.Summary.IsEmpty() ? TEXT("") : TEXT("\n")) + Line;
+	}
+}
+
+void UMotionForgeSubsystem::FinishCost(FMotionCostEstimate& Estimate, const TArray<FString>& Lines)
+{
+	for (const FString& Line : Lines)
+	{
+		Estimate.Summary += (Estimate.Summary.IsEmpty() ? TEXT("") : TEXT("\n")) + Line;
+	}
+}
+
+// -------------------------------------------------------------------------------------------------
+// Pipeline
+// -------------------------------------------------------------------------------------------------
 
 FString UMotionForgeSubsystem::MakeBatchId()
 {
@@ -774,7 +1944,9 @@ FString UMotionForgeSubsystem::MakeBatchId()
 
 FString UMotionForgeSubsystem::Generate(const TArray<FString>& AssetPaths)
 {
-	return StartGeneration(AssetPaths, UMotionForgeSettings::Get()->DefaultMode);
+	// Always stops for review. Whether a button spends unattended is not something a project setting
+	// should be able to change behind the person pressing it.
+	return StartGeneration(AssetPaths, EMotionPipelineMode::HumanInTheLoop);
 }
 
 FString UMotionForgeSubsystem::RunFullPipeline(const TArray<FString>& AssetPaths)
@@ -784,8 +1956,6 @@ FString UMotionForgeSubsystem::RunFullPipeline(const TArray<FString>& AssetPaths
 
 FString UMotionForgeSubsystem::StartGeneration(const TArray<FString>& AssetPaths, EMotionPipelineMode Mode)
 {
-	const UMotionForgeSettings* Settings = UMotionForgeSettings::Get();
-
 	const FString BatchId = MakeBatchId();
 
 	// Register the batch before submitting anything. A submit that fails at the transport layer can
@@ -797,7 +1967,8 @@ FString UMotionForgeSubsystem::StartGeneration(const TArray<FString>& AssetPaths
 	NewBatch.StartedAt = FPlatformTime::Seconds();
 	Batches.Add(BatchId, MoveTemp(NewBatch));
 
-	FMotionBatch& Batch = Batches[BatchId];
+	// Definitions whose provider has to be started first, grouped so each provider starts once.
+	TMap<FName, TArray<FString>> WaitingOnProvider;
 
 	for (const FString& AssetPath : AssetPaths)
 	{
@@ -817,176 +1988,94 @@ FString UMotionForgeSubsystem::StartGeneration(const TArray<FString>& AssetPaths
 			continue;
 		}
 
-		TSharedPtr<IMotionProvider> Provider;
-		UMotionCharacter* Character = nullptr;
-		FString Error;
-		if (!ResolveDefinition(Def, Provider, Character, Error))
+		FMotionResolvedRequest Resolved;
+		ResolveInternal(Def, Resolved, nullptr, /*bForSubmit*/ false);
+
+		if (!Resolved.bCanSubmit)
 		{
-			Def->SetStatus(EMotionDefStatus::Failed, Error);
+			Def->SetStatus(EMotionDefStatus::Failed, Resolved.Readiness.Problem);
 			SaveAsset(Def);
 			continue;
 		}
 
-		int32 MinLength = 1;
-		int32 MaxLength = 10;
-		Provider->GetLengthRange(Def->ModelId, MinLength, MaxLength);
+		FMotionBatch& Batch = Batches[BatchId];
 
-		// A prompt track on the definition's sequence is the prompt, and its sections are the beats.
-		//
-		// Resolved here, once, at the only point both providers pass through - so nothing downstream
-		// has to know whether the words came from a text box or a timeline. Same rule as the
-		// constraint sequence on the same asset: the sequence wins outright while it is set, and a
-		// track that will not read refuses the generation rather than quietly falling back to wording
-		// the artist stopped maintaining the day they laid it out in time.
-		FMotionPromptRead Beats;
-		FString PromptError;
-		if (!FMotionPromptSequence::Resolve(Def, ResolveFrameRate(Provider), Beats, PromptError))
+		if (Resolved.Readiness.Blocker == EMotionBlocker::ProviderStartable)
 		{
-			Def->SetStatus(EMotionDefStatus::Failed, PromptError);
+			WaitingOnProvider.FindOrAdd(Resolved.ProviderId).Add(Def->GetPathName());
+
+			Def->SetStatus(EMotionDefStatus::Generating);
+			Def->ActiveBatchId = BatchId;
+			Batch.DefinitionPaths.AddUnique(Def->GetPathName());
+			SetActivity(Def->GetPathName(), FString::Printf(
+				TEXT("%s - then %d %s"), *Resolved.Readiness.FixLabel, Resolved.Variants,
+				Resolved.Variants == 1 ? TEXT("take") : TEXT("takes")), /*bCanCancel*/ true);
 			SaveAsset(Def);
 			continue;
 		}
 
-		for (const FString& Problem : Beats.Problems)
-		{
-			UE_LOG(LogMotionForge, Warning, TEXT("'%s': %s"), *Def->GetName(), *Problem);
-		}
-
-		if (Beats.bFromSequence)
-		{
-			UE_LOG(LogMotionForge, Log,
-				TEXT("'%s': prompt from '%s' - %d beat(s), %.2fs: %s"),
-				*Def->GetName(), *Beats.SequencePath, Beats.Beats.Num(), Beats.TotalSeconds,
-				*FString::JoinBy(Beats.Beats, TEXT(" | "),
-					[](const FMotionPromptBeat& Beat)
-					{
-						return FString::Printf(TEXT("%.2fs '%s'"), Beat.Seconds, *Beat.Text);
-					}));
-		}
-
-		// Per-beat durations decide the clip's length, because they *are* the clip: the length is
-		// their sum and there is nothing left for `Length` to mean. Same rule as a constraint
-		// sequence winning over an authored constraint list - the more specific statement wins
-		// outright rather than being merged with the vaguer one.
-		float BeatTotal = 0.f;
-		for (const FMotionPromptBeat& Beat : Beats.Beats)
-		{
-			BeatTotal += Beat.Seconds;
-		}
-
-		const int32 Requested = Beats.Beats.Num() > 0
-			? FMath::Max(1, FMath::RoundToInt(BeatTotal))
-			: Def->Length;
-
-		if (Beats.Beats.Num() > 0 && Requested != Def->Length)
-		{
-			UE_LOG(LogMotionForge, Log,
-				TEXT("'%s': %d beat duration(s) totalling %.1fs, so Length %d is not used."),
-				*Def->GetName(), Beats.Beats.Num(), BeatTotal, Def->Length);
-		}
-
-		// Per-beat durations are not clamped against the whole-clip range, because they are not a
-		// whole-clip request: a provider that segments limits each *beat*, and the sum of legal beats
-		// is legal however large it gets. Clamping here truncated a 2+7+3 request to 10, warned about
-		// a length nobody asked for, and recorded a Length that disagreed with the clip - while the
-		// runner correctly generated all twelve seconds from the beats it was given.
-		const int32 Length = Beats.Beats.Num() > 0
-			? Requested
-			: FMath::Clamp(Requested, MinLength, MaxLength);
-
-		if (Length != Requested)
-		{
-			// Worth saying out loud - a model with a four second floor pads a shorter request rather
-			// than refusing it, and the padding is exactly what makes output look sluggish.
-			UE_LOG(LogMotionForge, Warning,
-				TEXT("'%s': length %d is outside %s's range for %s, using %d. Trim the result."),
-				*Def->GetName(), Requested, *Provider->GetDisplayName(), *Def->ModelId, Length);
-		}
-
-		Def->SetStatus(EMotionDefStatus::Generating);
-		Def->ActiveBatchId = Batch.BatchId;
-		Batch.DefinitionPaths.AddUnique(Def->GetPathName());
-
-		const FString DefPath = Def->GetPathName();
-		const FName ProviderId = Provider->GetProviderId();
-
-		for (int32 Variant = 0; Variant < FMath::Max(1, Def->Variants); ++Variant)
-		{
-			FMotionSubmitRequest Request;
-			Request.Prompt = Beats.Prompt;
-			Request.ModelId = Def->ModelId.IsEmpty() ? Provider->GetDefaultModelId() : Def->ModelId;
-			Request.ProviderCharacterId = Character->ProviderCharacterId;
-			Request.Length = Length;
-			Request.bRewritePrompt = Def->bRewritePrompt;
-			Request.VariantIndex = Variant;
-			Request.Control = Def->Control;
-			Request.TargetSkeleton = Character->TargetSkeleton.LoadSynchronous();
-
-			// The resolved beats, whichever route they came from. Written onto the request rather
-			// than back onto the asset: a prompt sequence is referenced and never baked, so the
-			// definition on disk must not quietly acquire the timeline's numbers.
-			Request.Control.BeatSeconds.Reset(Beats.Beats.Num());
-			for (const FMotionPromptBeat& Beat : Beats.Beats)
-			{
-				Request.Control.BeatSeconds.Add(Beat.Seconds);
-			}
-
-			// A fixed seed and several variants is a contradiction: every take would be identical.
-			// Walk the seed instead, so "four takes from seed 42" means four reproducible takes and
-			// not one clip generated four times.
-			if (Request.Control.Seed >= 0)
-			{
-				Request.Control.Seed += Variant;
-			}
-
-			Provider->SubmitJob(Request,
-				[this, BatchId, DefPath, ProviderId](const FMotionSubmitResult& SubmitResult)
-				{
-					FMotionBatch* LiveBatch = Batches.Find(BatchId);
-					UMotionDef* LiveDef = LoadDef(DefPath);
-					if (!LiveBatch || !LiveDef)
-					{
-						return;
-					}
-
-					if (!SubmitResult.bSuccess)
-					{
-						FMotionCandidate Failed;
-						Failed.VariantIndex = SubmitResult.VariantIndex;
-						Failed.Status = EMotionJobStatus::Failed;
-						Failed.Error = SubmitResult.Error;
-						Failed.GeneratedAt = FDateTime::Now();
-						LiveDef->Candidates.Add(Failed);
-
-						UE_LOG(LogMotionForge, Warning, TEXT("'%s' variant %d: %s"),
-							*LiveDef->GetName(), SubmitResult.VariantIndex, *SubmitResult.Error);
-
-						OnDefinitionGenerated(*LiveBatch, LiveDef);
-						return;
-					}
-
-					FMotionJobTracking Job;
-					Job.JobId = SubmitResult.JobId;
-					Job.DefinitionPath = DefPath;
-					Job.ProviderId = ProviderId;
-					Job.VariantIndex = SubmitResult.VariantIndex;
-					Job.SubmittedAt = FPlatformTime::Seconds();
-					LiveBatch->Jobs.Add(Job);
-
-					FMotionCandidate Candidate;
-					Candidate.JobId = SubmitResult.JobId;
-					Candidate.VariantIndex = SubmitResult.VariantIndex;
-					Candidate.Status = EMotionJobStatus::Pending;
-					Candidate.GeneratedAt = FDateTime::Now();
-					LiveDef->Candidates.Add(Candidate);
-					LiveDef->MarkPackageDirty();
-				});
-		}
-
-		SaveAsset(Def);
+		SubmitDefinition(Batch, Def);
 	}
 
-	if (Batch.DefinitionPaths.Num() == 0)
+	for (const TPair<FName, TArray<FString>>& Waiting : WaitingOnProvider)
+	{
+		TSharedPtr<IMotionProvider> Provider = FindProvider(Waiting.Key);
+		if (!Provider.IsValid())
+		{
+			continue;
+		}
+
+		Batches[BatchId].PendingPrepares++;
+
+		const TArray<FString> Paths = Waiting.Value;
+		TWeakObjectPtr<UMotionForgeSubsystem> WeakThis(this);
+
+		Provider->PrepareForWork([WeakThis, BatchId, Paths](bool bReady, const FString& Message)
+		{
+			UMotionForgeSubsystem* Self = WeakThis.Get();
+			if (!Self)
+			{
+				return;
+			}
+
+			FMotionBatch* Batch = Self->Batches.Find(BatchId);
+
+			for (const FString& Path : Paths)
+			{
+				UMotionDef* Def = Self->LoadDef(Path);
+				if (!Def)
+				{
+					continue;
+				}
+
+				// Cancelled while the provider was starting: the definition has already been settled.
+				if (Batch == nullptr || Batch->bCancelled || Def->ActiveBatchId != BatchId)
+				{
+					continue;
+				}
+
+				if (!bReady)
+				{
+					Def->SetStatus(EMotionDefStatus::Failed, Message);
+					Self->ClearActivity(Path);
+					SaveAsset(Def);
+					continue;
+				}
+
+				// Back to ready-to-submit, so SubmitDefinition's own busy check does not skip it.
+				Def->Status = EMotionDefStatus::Draft;
+				Self->SubmitDefinition(*Batch, Def);
+			}
+
+			if (Batch)
+			{
+				Batch->PendingPrepares = FMath::Max(0, Batch->PendingPrepares - 1);
+			}
+		});
+	}
+
+	FMotionBatch* Batch = Batches.Find(BatchId);
+	if (!Batch || Batch->DefinitionPaths.Num() == 0)
 	{
 		UE_LOG(LogMotionForge, Warning, TEXT("Nothing eligible to generate."));
 		Batches.Remove(BatchId);
@@ -994,10 +2083,146 @@ FString UMotionForgeSubsystem::StartGeneration(const TArray<FString>& AssetPaths
 	}
 
 	UE_LOG(LogMotionForge, Log, TEXT("Batch %s: %d definition(s), mode %s."),
-		*BatchId, Batch.DefinitionPaths.Num(),
+		*BatchId, Batch->DefinitionPaths.Num(),
 		Mode == EMotionPipelineMode::Automatic ? TEXT("Automatic") : TEXT("HumanInTheLoop"));
 
 	return BatchId;
+}
+
+void UMotionForgeSubsystem::SubmitDefinition(FMotionBatch& Batch, UMotionDef* Def)
+{
+	FMotionResolvedRequest Resolved;
+	TArray<FMotionSubmitRequest> Requests;
+	TSharedPtr<IMotionProvider> Provider;
+	UMotionCharacter* Character = nullptr;
+
+	const FString DefPath = Def->GetPathName();
+
+	if (!ResolveInternal(Def, Resolved, &Requests, /*bForSubmit*/ true, &Provider, &Character)
+		|| Requests.Num() == 0 || !Provider.IsValid())
+	{
+		Def->SetStatus(EMotionDefStatus::Failed, Resolved.Readiness.Problem.IsEmpty()
+			? FString(TEXT("Nothing could be submitted."))
+			: Resolved.Readiness.Problem);
+		ClearActivity(DefPath);
+		SaveAsset(Def);
+		return;
+	}
+
+	const FName ProviderId = Provider->GetProviderId();
+	const FString BatchId = Batch.BatchId;
+	const FMotionBilling Billing = Provider->GetBilling();
+	const float CostPerTake = Resolved.Variants > 0 ? Resolved.Cost.EstimatedCost / Resolved.Variants : 0.f;
+
+	Def->Modify();
+	Def->SetStatus(EMotionDefStatus::Generating);
+	Def->ActiveBatchId = BatchId;
+	Batch.DefinitionPaths.AddUnique(DefPath);
+
+	if (!Def->Character.IsNull())
+	{
+		Def->CharacterByProvider.Add(ProviderId, Def->Character);
+	}
+
+	SetActivity(DefPath, FString::Printf(TEXT("Generating %d %s on %s"),
+		Requests.Num(), Requests.Num() == 1 ? TEXT("take") : TEXT("takes"), *Resolved.ProviderDisplayName),
+		/*bCanCancel*/ true);
+
+	if (FMotionActivity* Activity = Activities.Find(DefPath))
+	{
+		Activity->Total = Requests.Num();
+	}
+
+	// Every take gets its record before it is submitted, carrying everything that made it. The
+	// callback only fills in the job id - so a take shows in the list the moment Generate is pressed,
+	// and a take whose submission fails still says what it was asked to be.
+	TArray<int32> TakeNumbers;
+
+	for (const FMotionSubmitRequest& Request : Requests)
+	{
+		FMotionCandidate Take;
+		Take.TakeNumber = Def->NextTakeNumber++;
+		Take.VariantIndex = Request.VariantIndex;
+		Take.Status = EMotionJobStatus::Pending;
+		Take.GeneratedAt = FDateTime::Now();
+		Take.ProviderId = ProviderId;
+		Take.ModelId = Request.ModelId;
+		Take.Character = Character ? FSoftObjectPath(Character) : FSoftObjectPath();
+		Take.Seed = Provider->GetCaps().bSupportsSeed ? Request.Control.Seed : -1;
+		Take.LengthSeconds = Request.LengthSeconds;
+		Take.PromptSent = Request.Prompt;
+		Take.RecipeHash = Resolved.RecipeHash;
+		Take.EstimatedCost = Billing.Unit == EMotionBillingUnit::PerGeneratedSecond ? CostPerTake : 0.f;
+		Take.Currency = Billing.Currency;
+
+		TArray<FString> Settings;
+		for (const FString& Setting : Resolved.Settings)
+		{
+			Settings.Add(Setting.StartsWith(TEXT("seed=")) ? FString::Printf(TEXT("seed=%d"), Take.Seed) : Setting);
+		}
+		Take.SettingsSent = FString::Join(Settings, TEXT(" "));
+
+		TakeNumbers.Add(Take.TakeNumber);
+		Def->Candidates.Add(MoveTemp(Take));
+	}
+
+	Batch.PendingSubmits.FindOrAdd(DefPath) += Requests.Num();
+	Def->MarkPackageDirty();
+	SaveAsset(Def);
+
+	for (int32 Index = 0; Index < Requests.Num(); ++Index)
+	{
+		const int32 TakeNumber = TakeNumbers[Index];
+
+		Provider->SubmitJob(Requests[Index],
+			[this, BatchId, DefPath, ProviderId, TakeNumber](const FMotionSubmitResult& SubmitResult)
+			{
+				FMotionBatch* LiveBatch = Batches.Find(BatchId);
+				UMotionDef* LiveDef = LoadDef(DefPath);
+				if (!LiveBatch || !LiveDef)
+				{
+					return;
+				}
+
+				if (int32* Pending = LiveBatch->PendingSubmits.Find(DefPath))
+				{
+					*Pending = FMath::Max(0, *Pending - 1);
+				}
+
+				FMotionCandidate* Take = LiveDef->Candidates.FindByPredicate(
+					[TakeNumber](const FMotionCandidate& C) { return C.TakeNumber == TakeNumber; });
+
+				if (!SubmitResult.bSuccess)
+				{
+					if (Take)
+					{
+						Take->Status = EMotionJobStatus::Failed;
+						Take->Error = SubmitResult.Error;
+					}
+
+					UE_LOG(LogMotionForge, Warning, TEXT("'%s' take %d: %s"),
+						*LiveDef->GetName(), TakeNumber, *SubmitResult.Error);
+
+					LiveDef->MarkPackageDirty();
+					OnDefinitionGenerated(*LiveBatch, LiveDef);
+					return;
+				}
+
+				FMotionJobTracking Job;
+				Job.JobId = SubmitResult.JobId;
+				Job.DefinitionPath = DefPath;
+				Job.ProviderId = ProviderId;
+				Job.VariantIndex = SubmitResult.VariantIndex;
+				Job.SubmittedAt = FPlatformTime::Seconds();
+				LiveBatch->Jobs.Add(Job);
+
+				if (Take)
+				{
+					Take->JobId = SubmitResult.JobId;
+				}
+				LiveDef->MarkPackageDirty();
+			});
+	}
 }
 
 bool UMotionForgeSubsystem::Tick(float DeltaTime)
@@ -1006,8 +2231,7 @@ bool UMotionForgeSubsystem::Tick(float DeltaTime)
 	//
 	// The sweep saves assets, and saving runs the validation subsystem - which at subsystem-init time
 	// has not registered its Blueprint validators yet and says so, once per asset, in a warning that
-	// reads like a fault in the asset rather than in when it was touched. Nothing is lost by waiting a
-	// frame: nobody can press Generate before the editor has drawn.
+	// reads like a fault in the asset rather than in when it was touched.
 	if (!bSweptStrandedDefinitions)
 	{
 		bSweptStrandedDefinitions = true;
@@ -1016,8 +2240,9 @@ bool UMotionForgeSubsystem::Tick(float DeltaTime)
 
 	const UMotionForgeSettings* Settings = UMotionForgeSettings::Get();
 	const double Now = FPlatformTime::Seconds();
+	const double Interval = FMath::Max(1, Settings->PollIntervalSeconds);
 
-	if (Now - LastPollTime < FMath::Max(1, Settings->PollIntervalSeconds))
+	if (Now - LastPollTime < Interval)
 	{
 		return true;
 	}
@@ -1051,8 +2276,42 @@ bool UMotionForgeSubsystem::Tick(float DeltaTime)
 				continue;
 			}
 
-			if (Now - Job.SubmittedAt > Settings->JobTimeoutSeconds)
+			// Past the timeout is late, not failed. The provider may still finish the job - and on a
+			// paid one, bill for it - so dropping it would throw away a take already paid for. It is
+			// polled less often from here, and Cancel is how a person stops waiting.
+			if (!Job.bLate && Now - Job.SubmittedAt > Settings->JobTimeoutSeconds)
 			{
+				Job.bLate = true;
+
+				if (UMotionDef* Def = LoadDef(Job.DefinitionPath))
+				{
+					if (FMotionCandidate* Candidate = Def->Candidates.FindByPredicate(
+						[&Job](const FMotionCandidate& C) { return C.JobId == Job.JobId; }))
+					{
+						Candidate->bLate = true;
+					}
+				}
+
+				if (FMotionActivity* Activity = Activities.Find(Job.DefinitionPath))
+				{
+					Activity->bLate = true;
+				}
+
+				UE_LOG(LogMotionForge, Warning,
+					TEXT("Job %s is past the %ds timeout. Still waiting, less often; cancel to stop."),
+					*Job.JobId, Settings->JobTimeoutSeconds);
+			}
+
+			if (Job.bLate && Now - Job.LastPolledAt < Interval * 4.0)
+			{
+				continue;
+			}
+
+			TSharedPtr<IMotionProvider> Provider = FindProvider(Job.ProviderId);
+			if (!Provider.IsValid())
+			{
+				// The provider's plugin went away mid-batch. Settle the take with the reason, so the
+				// definition can finish rather than wait for a poll that can never come.
 				Job.bSettled = true;
 
 				if (UMotionDef* Def = LoadDef(Job.DefinitionPath))
@@ -1061,21 +2320,17 @@ bool UMotionForgeSubsystem::Tick(float DeltaTime)
 						[&Job](const FMotionCandidate& C) { return C.JobId == Job.JobId; }))
 					{
 						Candidate->Status = EMotionJobStatus::Failed;
-						Candidate->Error = TEXT("Timed out waiting for the provider.");
+						Candidate->Error = FString::Printf(
+							TEXT("%s was unloaded while this was generating. The provider may still hold the take."),
+							*Job.ProviderId.ToString());
 					}
 					OnDefinitionGenerated(Batch, Def);
 				}
 				continue;
 			}
 
-			TSharedPtr<IMotionProvider> Provider = FindProvider(Job.ProviderId);
-			if (!Provider.IsValid())
-			{
-				Job.bSettled = true;
-				continue;
-			}
-
 			Job.bPollInFlight = true;
+			Job.LastPolledAt = Now;
 
 			const FString BatchId = Batch.BatchId;
 			const FString JobId = Job.JobId;
@@ -1091,7 +2346,7 @@ bool UMotionForgeSubsystem::Tick(float DeltaTime)
 
 					FMotionJobTracking* LiveJob = LiveBatch->Jobs.FindByPredicate(
 						[&JobId](const FMotionJobTracking& J) { return J.JobId == JobId; });
-					if (!LiveJob)
+					if (!LiveJob || LiveJob->bSettled)
 					{
 						return;
 					}
@@ -1104,18 +2359,35 @@ bool UMotionForgeSubsystem::Tick(float DeltaTime)
 						LiveJob->bSettled = true;
 						OnJobFinished(*LiveBatch, *LiveJob, JobResult);
 					}
+					else if (JobResult.Status == EMotionJobStatus::Running)
+					{
+						// Worth showing: queued and running are different waits, and on a shared GPU the
+						// difference explains the clock.
+						if (UMotionDef* Def = LoadDef(LiveJob->DefinitionPath))
+						{
+							if (FMotionCandidate* Candidate = Def->Candidates.FindByPredicate(
+								[&JobId](const FMotionCandidate& C) { return C.JobId == JobId; }))
+							{
+								Candidate->Status = EMotionJobStatus::Running;
+							}
+						}
+					}
 				});
 		}
 
-		if (Outstanding == 0 && Batch.Jobs.Num() > 0)
+		const int32 PendingSubmits = [&Batch]()
 		{
-			FinishedBatches.Add(Pair.Key);
-		}
-		else if (Batch.Jobs.Num() == 0 && Now - Batch.StartedAt > 60.0)
+			int32 Sum = 0;
+			for (const TPair<FString, int32>& Pending : Batch.PendingSubmits)
+			{
+				Sum += Pending.Value;
+			}
+			return Sum;
+		}();
+
+		if (Outstanding == 0 && PendingSubmits == 0 && Batch.PendingPrepares == 0)
 		{
-			// Every submit failed, so there is nothing to poll and nothing will ever arrive. Without
-			// this the batch would sit in the map forever being ticked over.
-			UE_LOG(LogMotionForge, Warning, TEXT("Batch %s produced no jobs."), *Pair.Key);
+			// Every job settled, or nothing was ever submitted - either way nothing more will arrive.
 			FinishedBatches.Add(Pair.Key);
 		}
 	}
@@ -1151,19 +2423,28 @@ void UMotionForgeSubsystem::OnJobFinished(
 	Candidate->Status = JobResult.Status;
 	Candidate->MotionId = JobResult.MotionId;
 	Candidate->Error = JobResult.Error;
+	Candidate->bLate = false;
 
 	if (JobResult.Status == EMotionJobStatus::Finished)
 	{
+		// The viewer link is for the character the take was made for, which is not necessarily the
+		// definition's character by the time the take finishes.
 		TSharedPtr<IMotionProvider> Provider = FindProvider(Job.ProviderId);
-		UMotionCharacter* Character = Def->Character.LoadSynchronous();
+		const UMotionCharacter* Character = Cast<UMotionCharacter>(Candidate->Character.TryLoad());
 
-		if (Provider.IsValid() && Character)
+		if (Provider.IsValid())
 		{
-			Candidate->ViewerUrl = Provider->MakeViewerUrl(Character->ProviderCharacterId, JobResult.MotionId);
+			Candidate->ViewerUrl = Provider->MakeViewerUrl(
+				Character ? Character->ProviderCharacterId : FString(), JobResult.MotionId);
 		}
 
-		UE_LOG(LogMotionForge, Log, TEXT("'%s' variant %d -> motion %s"),
-			*Def->GetName(), Job.VariantIndex, *JobResult.MotionId);
+		UE_LOG(LogMotionForge, Log, TEXT("'%s' %s -> motion %s"),
+			*Def->GetName(), *Candidate->GetLabel(), *JobResult.MotionId);
+	}
+
+	if (FMotionActivity* Activity = Activities.Find(Job.DefinitionPath))
+	{
+		++Activity->Done;
 	}
 
 	Def->MarkPackageDirty();
@@ -1172,8 +2453,17 @@ void UMotionForgeSubsystem::OnJobFinished(
 
 void UMotionForgeSubsystem::OnDefinitionGenerated(FMotionBatch& Batch, UMotionDef* Def)
 {
-	// Only act once every job belonging to this definition has settled.
+	// Only act once every take belonging to this definition has settled - submitted and answered.
 	const FString DefPath = Def->GetPathName();
+
+	if (const int32* Pending = Batch.PendingSubmits.Find(DefPath))
+	{
+		if (*Pending > 0)
+		{
+			return;
+		}
+	}
+
 	for (const FMotionJobTracking& Job : Batch.Jobs)
 	{
 		if (Job.DefinitionPath == DefPath && !Job.bSettled)
@@ -1182,33 +2472,15 @@ void UMotionForgeSubsystem::OnDefinitionGenerated(FMotionBatch& Batch, UMotionDe
 		}
 	}
 
-	const int32 Usable = Def->CountUsableCandidates();
-	if (Usable == 0)
+	// Cancelled already settled it.
+	if (Def->ActiveBatchId != Batch.BatchId && !Def->IsBusy())
 	{
-		Def->SetStatus(EMotionDefStatus::Failed, TEXT("No variant generated successfully."));
-		SaveAsset(Def);
 		return;
 	}
 
-	if (Batch.Mode == EMotionPipelineMode::HumanInTheLoop)
-	{
-		Def->SetStatus(EMotionDefStatus::AwaitingReview);
-		SaveAsset(Def);
+	ClearActivity(DefPath);
 
-		UE_LOG(LogMotionForge, Log, TEXT("'%s' has %d take(s) awaiting review."), *Def->GetName(), Usable);
-		return;
-	}
-
-	// Automatic: take the first usable variant **from this batch** and carry on.
-	//
-	// Not the first usable candidate on the asset. Candidates accumulate and are never pruned, so on
-	// the second run of a definition the oldest take is still at the front of the list - and picking
-	// it means every regeneration silently re-imports the first clip ever made. Invisible until
-	// somebody iterates: the prompt changes, the run reports success, and the animation does not move.
-	//
-	// Only the chosen take is downloaded. The others are not discarded - their motion ids are on the
-	// asset and the provider still holds them - so they can be fetched later if this one turns out to
-	// be wrong. Downloading all of them now would spend money on takes nobody has looked at.
+	// Takes from this run, told apart from older ones by the batch's jobs.
 	TSet<FString> JobsInThisBatch;
 	for (const FMotionJobTracking& Job : Batch.Jobs)
 	{
@@ -1219,28 +2491,58 @@ void UMotionForgeSubsystem::OnDefinitionGenerated(FMotionBatch& Batch, UMotionDe
 	}
 
 	const FMotionCandidate* Chosen = nullptr;
+	int32 NewUsable = 0;
 	for (const FMotionCandidate& Candidate : Def->Candidates)
 	{
-		if (Candidate.Status == EMotionJobStatus::Finished
-			&& Candidate.IsValidCandidate()
-			&& JobsInThisBatch.Contains(Candidate.JobId))
+		if (Candidate.IsUsable() && JobsInThisBatch.Contains(Candidate.JobId))
 		{
-			Chosen = &Candidate;
-			break;
+			++NewUsable;
+			if (!Chosen)
+			{
+				Chosen = &Candidate;
+			}
 		}
 	}
 
-	if (Chosen == nullptr)
+	if (NewUsable == 0)
 	{
-		// Older takes may well be usable, but importing one here would report this run as a success
-		// while quietly delivering a clip from a prompt nobody just asked for.
-		Def->SetStatus(EMotionDefStatus::Failed,
-			TEXT("No variant from this run generated successfully. Earlier takes are still on the "
-				 "asset and can be chosen by hand."));
+		// Say why, from the first failed take of this run, rather than a generic line.
+		FString Why = TEXT("No take generated successfully.");
+		for (int32 Index = Def->Candidates.Num() - 1; Index >= 0; --Index)
+		{
+			const FMotionCandidate& Candidate = Def->Candidates[Index];
+			if (Candidate.Status == EMotionJobStatus::Failed && !Candidate.Error.IsEmpty())
+			{
+				Why = FString::Printf(TEXT("%s failed: %s"), *Candidate.GetLabel(), *Candidate.Error);
+				break;
+			}
+		}
+
+		// Older takes may well be usable, and are still there to choose.
+		if (Def->CountUsableCandidates() > 0)
+		{
+			Def->SetStatus(EMotionDefStatus::AwaitingReview);
+			Def->LastError = Why;
+		}
+		else
+		{
+			Def->SetStatus(EMotionDefStatus::Failed, Why);
+		}
 		SaveAsset(Def);
 		return;
 	}
 
+	if (Batch.Mode == EMotionPipelineMode::HumanInTheLoop)
+	{
+		Def->SetStatus(EMotionDefStatus::AwaitingReview);
+		SaveAsset(Def);
+
+		UE_LOG(LogMotionForge, Log, TEXT("'%s' has %d new take(s) to review."), *Def->GetName(), NewUsable);
+		return;
+	}
+
+	// Automatic: take the first usable take **from this batch** and carry on. Not the first usable one
+	// on the asset - that would re-import the oldest take on every regeneration.
 	Def->SelectedMotionId = Chosen->MotionId;
 
 	SaveAsset(Def);
@@ -1257,12 +2559,31 @@ bool UMotionForgeSubsystem::SelectCandidate(const FString& AssetPath, const FStr
 
 	if (!Def->FindCandidate(MotionId))
 	{
-		UE_LOG(LogMotionForge, Warning, TEXT("'%s' has no candidate '%s'."), *Def->GetName(), *MotionId);
+		UE_LOG(LogMotionForge, Warning, TEXT("'%s' has no take '%s'."), *Def->GetName(), *MotionId);
 		return false;
 	}
 
+	Def->Modify();
 	Def->SelectedMotionId = MotionId;
+	Def->MarkPackageDirty();
 	SaveAsset(Def);
+	return true;
+}
+
+bool UMotionForgeSubsystem::ChooseAndImport(const FString& AssetPath, const FString& MotionId)
+{
+	if (!SelectCandidate(AssetPath, MotionId))
+	{
+		return false;
+	}
+
+	UMotionDef* Def = LoadDef(AssetPath);
+	if (!Def || Def->IsBusy())
+	{
+		return false;
+	}
+
+	ProcessSelected(Def);
 	return true;
 }
 
@@ -1280,7 +2601,7 @@ FString UMotionForgeSubsystem::DownloadSelected(const TArray<FString>& AssetPath
 
 		if (Def->SelectedMotionId.IsEmpty())
 		{
-			UE_LOG(LogMotionForge, Warning, TEXT("'%s' has nothing selected."), *Def->GetName());
+			UE_LOG(LogMotionForge, Warning, TEXT("'%s' has no take chosen."), *Def->GetName());
 			continue;
 		}
 
@@ -1294,6 +2615,59 @@ FString UMotionForgeSubsystem::DownloadSelected(const TArray<FString>& AssetPath
 	return MotionForgeJson::Serialize(Response);
 }
 
+bool UMotionForgeSubsystem::ResolveTakeRoute(
+	UMotionDef* Def,
+	const FMotionCandidate& Take,
+	TSharedPtr<IMotionProvider>& OutProvider,
+	UMotionCharacter*& OutCharacter,
+	FString& OutError) const
+{
+	// The provider that made the take, whatever the definition uses now. Importing an Uthana take
+	// through Kimodo because the definition moved on would read a file in the wrong format.
+	const FName ProviderId = Take.ProviderId.IsNone() ? ResolveProviderId(Def->ProviderId) : Take.ProviderId;
+
+	OutProvider = FindProvider(ProviderId);
+	if (!OutProvider.IsValid())
+	{
+		OutError = FString::Printf(TEXT("%s was made by %s, which is not installed. Install it to import this take."),
+			*Take.GetLabel(), *ProviderId.ToString());
+		return false;
+	}
+
+	const FMotionProviderCaps Caps = OutProvider->GetCaps();
+
+	UMotionCharacter* Current = Def->Character.LoadSynchronous();
+	UMotionCharacter* Maker = Cast<UMotionCharacter>(Take.Character.TryLoad());
+
+	// A provider that generates against an uploaded character returns motion on that character's rig,
+	// so the take belongs with the character it was made for. One that generates on its own rig
+	// returns motion any suitable character can take, so the definition's current one wins - which is
+	// what lets a take made for the wrong character be imported after fixing the character.
+	if (Caps.bSupportsCharacterUpload)
+	{
+		OutCharacter = Maker ? Maker : Current;
+	}
+	else
+	{
+		OutCharacter = (Current && DoesCharacterSuit(Current, ProviderId)) ? Current : Maker;
+	}
+
+	if (!OutCharacter)
+	{
+		OutError = TEXT("No Motion Character to import this take onto.");
+		return false;
+	}
+
+	FString Why;
+	if (!DoesCharacterSuit(OutCharacter, ProviderId, &Why))
+	{
+		OutError = Why;
+		return false;
+	}
+
+	return true;
+}
+
 void UMotionForgeSubsystem::ProcessSelected(UMotionDef* Def)
 {
 	const UMotionForgeSettings* Settings = UMotionForgeSettings::Get();
@@ -1301,23 +2675,34 @@ void UMotionForgeSubsystem::ProcessSelected(UMotionDef* Def)
 	const FMotionCandidate* Selected = Def->FindSelectedCandidate();
 	if (!Selected)
 	{
-		Def->SetStatus(EMotionDefStatus::Failed, TEXT("Selected motion is not among the candidates."));
+		Def->SetStatus(EMotionDefStatus::Failed, TEXT("The chosen take is not among this definition's takes."));
 		SaveAsset(Def);
 		return;
 	}
 
-	// Already on disk from an earlier run - skip straight to processing rather than paying again.
-	if (Selected->bDownloaded && FPaths::FileExists(Selected->LocalRawPath))
+	if (!Selected->IsUsable())
 	{
-		UE_LOG(LogMotionForge, Log, TEXT("'%s': reusing '%s'."), *Def->GetName(), *Selected->LocalRawPath);
-		NormalizeAndImport(Def, Selected->LocalRawPath);
+		Def->SetStatus(EMotionDefStatus::Failed, FString::Printf(TEXT("%s has not finished generating."), *Selected->GetLabel()));
+		SaveAsset(Def);
+		return;
+	}
+
+	const FString MotionId = Selected->MotionId;
+	const FString Label = Selected->GetLabel();
+
+	// Already on disk from an earlier run - skip straight to importing rather than paying again.
+	const FString OnDisk = FindTakeFile(*Selected);
+	if (!OnDisk.IsEmpty())
+	{
+		UE_LOG(LogMotionForge, Log, TEXT("'%s': reusing '%s'."), *Def->GetName(), *OnDisk);
+		NormalizeAndImport(Def, MotionId, OnDisk);
 		return;
 	}
 
 	TSharedPtr<IMotionProvider> Provider;
 	UMotionCharacter* Character = nullptr;
 	FString Error;
-	if (!ResolveDefinition(Def, Provider, Character, Error))
+	if (!ResolveTakeRoute(Def, *Selected, Provider, Character, Error))
 	{
 		Def->SetStatus(EMotionDefStatus::Failed, Error);
 		SaveAsset(Def);
@@ -1328,15 +2713,19 @@ void UMotionForgeSubsystem::ProcessSelected(UMotionDef* Def)
 	// artifact .fbx would send it into an importer that cannot read it.
 	const FString RawPath = Settings->GetAbsoluteStagingDirectory()
 		/ FString::Printf(TEXT("%s_%s_raw.%s"),
-			*Def->GetName(), *Selected->MotionId, *Provider->GetArtifactExtension());
+			*Def->GetName(), *MotionId, *Provider->GetArtifactExtension());
 
 	Def->SetStatus(EMotionDefStatus::Downloading);
+	SetActivity(Def->GetPathName(), FString::Printf(TEXT("Downloading %s"), *Label), /*bCanCancel*/ false);
 	SaveAsset(Def);
 
 	const FString DefPath = Def->GetPathName();
-	const FString MotionId = Selected->MotionId;
 
-	Provider->DownloadMotion(Character->ProviderCharacterId, MotionId, RawPath, ResolveFrameRate(Provider),
+	// The uploaded id of the character the take was made for, which is what the provider files it under.
+	const UMotionCharacter* Maker = Cast<UMotionCharacter>(Selected->Character.TryLoad());
+	const FString ProviderCharacterId = Maker ? Maker->ProviderCharacterId : Character->ProviderCharacterId;
+
+	Provider->DownloadMotion(ProviderCharacterId, MotionId, RawPath, ResolveFrameRate(Provider),
 		[this, DefPath, MotionId, RawPath](bool bSuccess, const FString& DownloadError)
 		{
 			UMotionDef* LiveDef = LoadDef(DefPath);
@@ -1347,6 +2736,7 @@ void UMotionForgeSubsystem::ProcessSelected(UMotionDef* Def)
 
 			if (!bSuccess)
 			{
+				ClearActivity(DefPath);
 				LiveDef->SetStatus(EMotionDefStatus::Failed, DownloadError);
 				SaveAsset(LiveDef);
 				return;
@@ -1358,205 +2748,153 @@ void UMotionForgeSubsystem::ProcessSelected(UMotionDef* Def)
 				Candidate->LocalRawPath = RawPath;
 			}
 
-			NormalizeAndImport(LiveDef, RawPath);
+			NormalizeAndImport(LiveDef, MotionId, RawPath);
 		});
 }
 
-void UMotionForgeSubsystem::NormalizeAndImport(UMotionDef* Def, const FString& RawPath)
+void UMotionForgeSubsystem::NormalizeAndImport(UMotionDef* Def, const FString& MotionId, const FString& RawPath)
 {
 	const UMotionForgeSettings* Settings = UMotionForgeSettings::Get();
+	const FString DefPath = Def->GetPathName();
+
+	const FMotionCandidate* Take = Def->FindCandidate(MotionId);
+	if (!Take)
+	{
+		ClearActivity(DefPath);
+		Def->SetStatus(EMotionDefStatus::Failed, TEXT("The take being imported is no longer on this definition."));
+		SaveAsset(Def);
+		return;
+	}
+
+	TSharedPtr<IMotionProvider> Provider;
+	UMotionCharacter* Character = nullptr;
+	FString RouteError;
+	if (!ResolveTakeRoute(Def, *Take, Provider, Character, RouteError))
+	{
+		ClearActivity(DefPath);
+		Def->SetStatus(EMotionDefStatus::Failed, RouteError);
+		SaveAsset(Def);
+		return;
+	}
+
+	const FMotionCandidate TakeCopy = *Take;
 
 	Def->SetStatus(EMotionDefStatus::Processing);
+	SetActivity(DefPath, FString::Printf(TEXT("Importing %s"), *TakeCopy.GetLabel()), /*bCanCancel*/ false);
 
-	const FName ProviderId = Def->ProviderId.IsNone() ? Settings->DefaultProviderId : Def->ProviderId;
-	TSharedPtr<IMotionProvider> Provider = FindProvider(ProviderId);
+	// Whether a take lands on the provider's rig and is retargeted, or straight on the game's skeleton,
+	// is the character's choice: a Provider Mesh set means retarget.
+	USkeletalMesh* ProviderMesh = Character->ProviderMesh.LoadSynchronous();
+	const bool bRetargeting = ProviderMesh != nullptr;
 
-	UMotionCharacter* ArtifactCharacter = Def->Character.IsNull()
-		? Settings->DefaultCharacter.LoadSynchronous()
-		: Def->Character.LoadSynchronous();
+	USkeleton* ImportSkeleton = bRetargeting
+		? ProviderMesh->GetSkeleton()
+		: Character->TargetSkeleton.LoadSynchronous();
+
+	if (!ImportSkeleton)
+	{
+		ClearActivity(DefPath);
+		Def->SetStatus(EMotionDefStatus::Failed, bRetargeting
+			? FString::Printf(TEXT("'%s''s Provider Mesh '%s' has no skeleton, so there is nothing to build the take on."),
+				*Character->GetDisplayName(), *ProviderMesh->GetName())
+			: FString::Printf(TEXT("'%s' has no Target Skeleton, so there is nothing to build the take on."),
+				*Character->GetDisplayName()));
+		SaveAsset(Def);
+		return;
+	}
+
+	UAnimSequence* Built = nullptr;
+	bool bWasNormalized = false;
 
 	// Providers whose output is not an FBX build the animation themselves. They know exactly what
 	// their numbers mean; routing them through a file format and a Blender pass in between only adds
 	// two more places for a coordinate convention to be silently lost.
-	if (Provider.IsValid() && Provider->HandlesImport())
+	if (Provider->HandlesImport())
 	{
-		if (!ArtifactCharacter)
-		{
-			Def->SetStatus(EMotionDefStatus::Failed, TEXT("No Motion Character to import against."));
-			SaveAsset(Def);
-			return;
-		}
-
-		// Same fork as the FBX path below. With a Provider Mesh the clip is built on the provider's
-		// own rig and moved across by an IK Retargeter, which is what buys IK on the limbs; without
-		// one it is built straight onto the game's skeleton by orientation matching alone. Both are
-		// supported deliberately - the first is better, the second needs no setup at all.
-		USkeletalMesh* ArtifactProviderMesh = ArtifactCharacter->ProviderMesh.LoadSynchronous();
-
-		USkeleton* Skeleton = ArtifactProviderMesh
-			? ArtifactProviderMesh->GetSkeleton()
-			: ArtifactCharacter->TargetSkeleton.LoadSynchronous();
-
-		if (!Skeleton)
-		{
-			Def->SetStatus(EMotionDefStatus::Failed, FString::Printf(
-				TEXT("Character '%s' has no Target Skeleton, so there is nothing to build the "
-					 "animation on."),
-				*ArtifactCharacter->GetDisplayName()));
-			SaveAsset(Def);
-			return;
-		}
-
-		const bool bArtifactRetargeting = ArtifactProviderMesh != nullptr;
-
 		FMotionArtifactImport ArtifactRequest;
 		ArtifactRequest.AbsoluteArtifactPath = RawPath;
-		ArtifactRequest.DestinationPackagePath = bArtifactRetargeting
-			? Settings->GetSourceTakesPath()
-			: Settings->GetTakesPath();
-		ArtifactRequest.AssetName = bArtifactRetargeting
+		ArtifactRequest.DestinationPackagePath = bRetargeting ? Settings->GetSourceTakesPath() : Settings->GetTakesPath();
+		ArtifactRequest.AssetName = bRetargeting
 			? FString::Printf(TEXT("AS_%s_Source"), *Def->GetName())
 			: FString::Printf(TEXT("AS_%s"), *Def->GetName());
-		ArtifactRequest.TargetSkeleton = Skeleton;
+		ArtifactRequest.TargetSkeleton = ImportSkeleton;
 		ArtifactRequest.TrimWindow = Def->TrimWindow;
 		ArtifactRequest.bZeroRootTranslation = Settings->bZeroRootTranslation;
 
 		const FMotionArtifactResult ArtifactResult = Provider->ImportArtifact(ArtifactRequest);
 		if (!ArtifactResult.bSuccess)
 		{
+			ClearActivity(DefPath);
 			Def->SetStatus(EMotionDefStatus::Failed, ArtifactResult.Error);
 			SaveAsset(Def);
 			return;
 		}
 
-		UAnimSequence* ArtifactSequence = ArtifactResult.Sequence.LoadSynchronous();
+		Built = ArtifactResult.Sequence.LoadSynchronous();
+	}
+	else
+	{
+		FMotionNormalizeRequest NormalizeRequest;
+		NormalizeRequest.AbsoluteInputPath = RawPath;
+		NormalizeRequest.AbsoluteOutputPath = FPaths::Combine(
+			FPaths::GetPath(RawPath),
+			FPaths::GetBaseFilename(RawPath).Replace(TEXT("_raw"), TEXT("_clean")) + TEXT(".fbx"));
+		NormalizeRequest.TrimWindow = Def->TrimWindow;
+		NormalizeRequest.FrameRate = ResolveFrameRate(Provider);
+		NormalizeRequest.bZeroRootTranslation = Settings->bZeroRootTranslation;
+		NormalizeRequest.bEnsureRootBone = Settings->bEnsureRootBone;
 
-		if (bArtifactRetargeting)
+		const FMotionNormalizeResult NormalizeResult = FMotionNormalizeTask::Run(NormalizeRequest);
+		if (!NormalizeResult.bSuccess)
 		{
-			FString RetargetError;
-			UAnimSequence* Retargeted =
-				RetargetToCharacterRig(Def, ArtifactCharacter, ArtifactSequence, RetargetError);
+			ClearActivity(DefPath);
+			Def->SetStatus(EMotionDefStatus::Failed, NormalizeResult.Error);
+			SaveAsset(Def);
+			return;
+		}
+		bWasNormalized = !NormalizeResult.bSkipped;
 
-			if (!Retargeted)
-			{
-				// The source clip is on disk and correct; only the conversion is missing. Say so
-				// rather than implying it has to be generated again.
-				Def->SetStatus(EMotionDefStatus::Failed, FString::Printf(
-					TEXT("%s Built on the provider rig as '%s' - fix the retarget setup and run "
-						 "Download And Import Selected again; nothing needs regenerating."),
-					*RetargetError, *ArtifactResult.Sequence.ToString()));
-				SaveAsset(Def);
-				return;
-			}
+		FMotionImportRequest ImportRequest;
+		ImportRequest.AbsoluteFbxPath = NormalizeResult.OutputPath;
+		ImportRequest.DestinationPackagePath = bRetargeting ? Settings->GetSourceTakesPath() : Settings->GetTakesPath();
 
-			ArtifactSequence = Retargeted;
+		// Land the provider-rig clip under a _Source name when it is an intermediate, so the name a
+		// human reaches for always belongs to the asset on our own skeleton.
+		ImportRequest.AssetName = bRetargeting
+			? FString::Printf(TEXT("AS_%s_Source"), *Def->GetName())
+			: FString::Printf(TEXT("AS_%s"), *Def->GetName());
+
+		ImportRequest.TargetSkeleton = ImportSkeleton;
+		ImportRequest.FrameRate = ResolveFrameRate(Provider);
+
+		const FMotionImportResult ImportResult = FMotionImporter::Import(ImportRequest);
+		if (!ImportResult.bSuccess)
+		{
+			ClearActivity(DefPath);
+			Def->SetStatus(EMotionDefStatus::Failed, ImportResult.Error);
+			SaveAsset(Def);
+			return;
 		}
 
-		FMotionProvenance::Stamp(ArtifactSequence, Def, Provider->GetProviderId().ToString(),
-			Def->ModelId.IsEmpty() ? Provider->GetDefaultModelId() : Def->ModelId, Def->SelectedMotionId,
-			Provider->GetDisplayName(), Provider->GetCaps().bIsLocal,
-			Provider->GetCaps().NativeFrameRate, /*bWasNormalized*/ false, bArtifactRetargeting);
-
-		Def->ImportedSequence = ArtifactSequence;
-		Def->SetStatus(EMotionDefStatus::Ready);
-		SaveAsset(Def);
-
-		PlaceTakeOnPromptSequence(Def, ArtifactSequence);
-
-		UE_LOG(LogMotionForge, Log, TEXT("'%s' is ready: %s (built by %s%s)"),
-			*Def->GetName(), *ArtifactSequence->GetPathName(), *Provider->GetDisplayName(),
-			bArtifactRetargeting ? TEXT(", retargeted from its own rig") : TEXT(""));
-		return;
+		Built = ImportResult.Sequence.LoadSynchronous();
 	}
 
-	FMotionNormalizeRequest NormalizeRequest;
-	NormalizeRequest.AbsoluteInputPath = RawPath;
-	NormalizeRequest.AbsoluteOutputPath = FPaths::Combine(
-		FPaths::GetPath(RawPath),
-		FPaths::GetBaseFilename(RawPath).Replace(TEXT("_raw"), TEXT("_clean")) + TEXT(".fbx"));
-	NormalizeRequest.TrimWindow = Def->TrimWindow;
-	NormalizeRequest.FrameRate = ResolveFrameRate(Provider);
-	NormalizeRequest.bZeroRootTranslation = Settings->bZeroRootTranslation;
-	NormalizeRequest.bEnsureRootBone = Settings->bEnsureRootBone;
+	UAnimSequence* Final = Built;
 
-	const FMotionNormalizeResult NormalizeResult = FMotionNormalizeTask::Run(NormalizeRequest);
-	if (!NormalizeResult.bSuccess)
-	{
-		Def->SetStatus(EMotionDefStatus::Failed, NormalizeResult.Error);
-		SaveAsset(Def);
-		return;
-	}
-
-	UMotionCharacter* Character = Def->Character.IsNull()
-		? Settings->DefaultCharacter.LoadSynchronous()
-		: Def->Character.LoadSynchronous();
-
-	if (!Character)
-	{
-		Def->SetStatus(EMotionDefStatus::Failed, TEXT("No Motion Character to import against."));
-		SaveAsset(Def);
-		return;
-	}
-
-	// Import onto the provider's own rig when we have a copy of it. Their file matches that skeleton
-	// exactly, so nothing has to be reconstructed; the difference from our rig is then handled by a
-	// retargeter, which is built for exactly that and does it correctly.
-	USkeletalMesh* ProviderMesh = Character->ProviderMesh.LoadSynchronous();
-	USkeleton* ImportSkeleton = ProviderMesh
-		? ProviderMesh->GetSkeleton()
-		: Character->TargetSkeleton.LoadSynchronous();
-
-	if (!ImportSkeleton)
-	{
-		Def->SetStatus(EMotionDefStatus::Failed,
-			TEXT("No skeleton to import against - set Provider Mesh (preferred) or Target Skeleton "
-				 "on the Motion Character."));
-		SaveAsset(Def);
-		return;
-	}
-
-	const bool bRetargeting = ProviderMesh != nullptr;
-
-	FMotionImportRequest ImportRequest;
-	ImportRequest.AbsoluteFbxPath = NormalizeResult.OutputPath;
-	ImportRequest.DestinationPackagePath = bRetargeting
-		? Settings->GetSourceTakesPath()
-		: Settings->GetTakesPath();
-
-	// Land the provider-rig clip under a _Source name when it is an intermediate, so the name a
-	// human reaches for always belongs to the asset on our own skeleton.
-	ImportRequest.AssetName = bRetargeting
-		? FString::Printf(TEXT("AS_%s_Source"), *Def->GetName())
-		: FString::Printf(TEXT("AS_%s"), *Def->GetName());
-
-	ImportRequest.TargetSkeleton = ImportSkeleton;
-	ImportRequest.FrameRate = ResolveFrameRate(Provider);
-
-	const FMotionImportResult ImportResult = FMotionImporter::Import(ImportRequest);
-	if (!ImportResult.bSuccess)
-	{
-		Def->SetStatus(EMotionDefStatus::Failed, ImportResult.Error);
-		SaveAsset(Def);
-		return;
-	}
-
-	UAnimSequence* Imported = ImportResult.Sequence.LoadSynchronous();
-	UAnimSequence* Final = Imported;
-
-	if (bRetargeting)
+	if (bRetargeting && Built)
 	{
 		FString RetargetError;
-		UAnimSequence* Retargeted = RetargetToCharacterRig(Def, Character, Imported, RetargetError);
+		UAnimSequence* Retargeted = RetargetToCharacterRig(Def, Character, Built, RetargetError);
 
 		if (!Retargeted)
 		{
-			// The source clip is on disk and correct; only the conversion is missing. Say that,
-			// rather than implying the whole thing has to be generated again - it does not, and on
-			// pay-as-you-go regenerating would cost money for nothing.
+			// The source clip is on disk and correct; only the conversion is missing. Say so rather
+			// than implying it has to be generated again - on pay-as-you-go that would cost money.
+			ClearActivity(DefPath);
 			Def->SetStatus(EMotionDefStatus::Failed, FString::Printf(
-				TEXT("%s Imported on the provider rig as '%s' - fix the retarget setup and run "
-					 "Download And Import Selected again; nothing needs regenerating."),
-				*RetargetError, *ImportResult.Sequence.ToString()));
+				TEXT("%s The take was built on the provider rig as '%s'. Fix the retarget setup and press "
+					 "Import again; nothing needs generating again."),
+				*RetargetError, *Built->GetName()));
 			SaveAsset(Def);
 			return;
 		}
@@ -1564,24 +2902,33 @@ void UMotionForgeSubsystem::NormalizeAndImport(UMotionDef* Def, const FString& R
 		Final = Retargeted;
 	}
 
-	// Whether the Blender round trip actually ran, not whether it was asked for. The distinction is
-	// the whole reason this field exists: it used to depend on which computer did the import.
+	if (!Final)
+	{
+		ClearActivity(DefPath);
+		Def->SetStatus(EMotionDefStatus::Failed, TEXT("The import produced no animation."));
+		SaveAsset(Def);
+		return;
+	}
+
 	FMotionProvenance::Stamp(Final, Def, Provider->GetProviderId().ToString(),
-		Def->ModelId.IsEmpty() ? Provider->GetDefaultModelId() : Def->ModelId, Def->SelectedMotionId,
+		TakeCopy.ModelId.IsEmpty() ? Provider->GetDefaultModelId() : TakeCopy.ModelId, MotionId,
 		Provider->GetDisplayName(), Provider->GetCaps().bIsLocal,
-		Provider->GetCaps().NativeFrameRate, !NormalizeResult.bSkipped, bRetargeting);
+		Provider->GetCaps().NativeFrameRate, bWasNormalized, bRetargeting, &TakeCopy);
 
 	Def->ImportedSequence = Final;
+	Def->ImportedMotionId = MotionId;
+	ClearActivity(DefPath);
 	Def->SetStatus(EMotionDefStatus::Ready);
 	SaveAsset(Def);
 
+	// The preview of this take has done its job; the real clip is what should be watched now.
+	Previews.Remove(DefPath + TEXT("|") + MotionId);
+
 	PlaceTakeOnPromptSequence(Def, Final);
 
-	UE_LOG(LogMotionForge, Log, TEXT("'%s' is ready: %s%s%s"),
-		*Def->GetName(),
-		*Final->GetPathName(),
-		bRetargeting ? TEXT(" (retargeted from the provider rig)") : TEXT(""),
-		NormalizeResult.bSkipped ? TEXT(" (imported without normalisation)") : TEXT(""));
+	UE_LOG(LogMotionForge, Log, TEXT("'%s' is ready: %s from %s (%s%s)"),
+		*Def->GetName(), *Final->GetPathName(), *TakeCopy.GetLabel(), *Provider->GetDisplayName(),
+		bRetargeting ? TEXT(", retargeted from the provider rig") : TEXT(""));
 }
 
 UAnimSequence* UMotionForgeSubsystem::RetargetToCharacterRig(
@@ -1608,8 +2955,7 @@ UAnimSequence* UMotionForgeSubsystem::RetargetToCharacterRig(
 				*Def->GetName(), *Def->RetargeterOverride.ToString())
 			: FString::Printf(
 				TEXT("'%s' has a Provider Mesh but no Retargeter, so the clip cannot be moved onto "
-					 "the game's skeleton. Author an IK Retargeter from Provider Mesh to Preview "
-					 "Mesh and set it on the character."),
+					 "the game's skeleton."),
 				*Character->GetDisplayName());
 		return nullptr;
 	}
@@ -1623,7 +2969,7 @@ UAnimSequence* UMotionForgeSubsystem::RetargetToCharacterRig(
 
 	if (!TargetMesh)
 	{
-		OutError = TEXT("Retargeting needs Preview Mesh set to the mesh on the game's skeleton.");
+		OutError = TEXT("Retargeting needs the character's Preview Mesh: the mesh on the game's skeleton.");
 		return nullptr;
 	}
 
@@ -1652,15 +2998,9 @@ UAnimSequence* UMotionForgeSubsystem::RetargetToCharacterRig(
 		{
 			SaveAsset(Sequence);
 
-			// The intermediate has done its job. Delete it unless somebody asked to keep it.
-			//
-			// It is derivable twice over - the cached .mfmo rebuilds it without touching the
-			// provider, and a seeded generator reproduces the clip outright - so keeping it by
-			// default only doubles the asset count and leaves two similarly-named animations for the
-			// next person to choose between.
-			//
-			// Deleted only after the retargeted result is safely saved, and only if the two are
-			// genuinely different assets, so a failure upstream never costs both.
+			// The intermediate has done its job. Delete it unless somebody asked to keep it - it is
+			// derivable twice over, from the cached file and from the recipe. Deleted only after the
+			// retargeted result is safely saved, and only if the two are genuinely different assets.
 			if (!Settings->bKeepSourceClips && Sequence != SourceSequence)
 			{
 				DeleteSourceClip(SourceSequence);
@@ -1672,9 +3012,138 @@ UAnimSequence* UMotionForgeSubsystem::RetargetToCharacterRig(
 
 	OutError = FString::Printf(
 		TEXT("Retargeting '%s' produced no animation. The IK Retargeter's source and target rigs "
-			 "most likely do not match Provider Mesh and Preview Mesh."),
+			 "most likely do not match the Provider Mesh and Preview Mesh."),
 		*SourceSequence->GetName());
 	return nullptr;
+}
+
+UAnimSequence* UMotionForgeSubsystem::RetargetForPreview(
+	UMotionDef* Def,
+	UMotionCharacter* Character,
+	UAnimSequence* SourceSequence,
+	FString& OutError)
+{
+	// The engine's batch retarget writes assets through the asset tools, which refuse any folder
+	// outside a content root with a modal dialog - /Temp included - so a preview cannot use it. This
+	// is its per-frame loop, the part that does the retargeting, into a clip nobody saves.
+	UIKRetargeter* Retargeter = !Def->RetargeterOverride.IsNull()
+		? Def->RetargeterOverride.LoadSynchronous()
+		: Character->Retargeter.LoadSynchronous();
+	USkeletalMesh* SourceMesh = Character->ProviderMesh.LoadSynchronous();
+	USkeletalMesh* TargetMesh = Character->PreviewMesh.LoadSynchronous();
+
+	if (!Retargeter || !SourceMesh || !TargetMesh || !TargetMesh->GetSkeleton() || !SourceSequence)
+	{
+		OutError = TEXT("The preview needs the character's Retargeter, Provider Mesh and Preview Mesh, as the import does.");
+		return nullptr;
+	}
+
+	FRetargetProfile Profile;
+	Profile.FillProfileWithAssetSettings(Retargeter);
+
+	FRetargetInitParameters InitParams;
+	InitParams.SourceSkeletalMesh = SourceMesh;
+	InitParams.TargetSkeletalMesh = TargetMesh;
+	InitParams.RetargeterAsset = Retargeter;
+	InitParams.CustomProfile = &Profile;
+	InitParams.bSuppressWarnings = true;
+
+	FIKRetargetProcessor Processor;
+	Processor.Initialize(InitParams);
+	if (!Processor.IsInitialized())
+	{
+		OutError = FString::Printf(TEXT("The IK Retargeter %s could not start with %s and %s. Its rigs most likely do not match them."),
+			*Retargeter->GetName(), *SourceMesh->GetName(), *TargetMesh->GetName());
+		return nullptr;
+	}
+
+	const FRetargetSkeleton& Source = Processor.GetSkeleton(ERetargetSourceOrTarget::Source);
+	const FRetargetSkeleton& Target = Processor.GetSkeleton(ERetargetSourceOrTarget::Target);
+	const int32 NumSourceBones = Source.BoneNames.Num();
+	const int32 NumTargetBones = Target.BoneNames.Num();
+	const int32 NumFrames = SourceSequence->GetNumberOfSampledKeys();
+
+	if (NumFrames <= 0 || NumTargetBones == 0)
+	{
+		OutError = TEXT("The clip has no frames to retarget.");
+		return nullptr;
+	}
+
+	TArray<FRawAnimSequenceTrack> Tracks;
+	Tracks.SetNum(NumTargetBones);
+	for (FRawAnimSequenceTrack& Track : Tracks)
+	{
+		Track.PosKeys.SetNum(NumFrames);
+		Track.RotKeys.SetNum(NumFrames);
+		Track.ScaleKeys.SetNum(NumFrames);
+	}
+
+	FAnimPoseEvaluationOptions Evaluation;
+	Evaluation.OptionalSkeletalMesh = SourceMesh;
+	Evaluation.bExtractRootMotion = false;
+	Evaluation.bIncorporateRootMotionIntoPose = true;
+
+	TArray<FTransform> SourcePose;
+	SourcePose.SetNum(NumSourceBones);
+
+	Processor.OnPlaybackReset();
+
+	for (int32 Frame = 0; Frame < NumFrames; ++Frame)
+	{
+		FAnimPose Pose;
+		UAnimPoseExtensions::GetAnimPoseAtFrame(SourceSequence, Frame, Evaluation, Pose);
+
+		for (int32 Bone = 0; Bone < NumSourceBones; ++Bone)
+		{
+			SourcePose[Bone] = UAnimPoseExtensions::GetBonePose(Pose, Source.BoneNames[Bone], EAnimPoseSpaces::World);
+			SourcePose[Bone].SetScale3D(FVector::OneVector);
+		}
+
+		const float Time = SourceSequence->GetTimeAtFrame(Frame);
+		const float DeltaTime = Frame > 0 ? Time - SourceSequence->GetTimeAtFrame(Frame - 1) : Time;
+
+		Processor.ApplySourceScaleToPose(SourcePose);
+		Processor.UpdateOpsFromAnimSequence(SourceSequence, Time);
+
+		FRetargetRunParameters RunParams;
+		RunParams.SourceGlobalPose = &SourcePose;
+		RunParams.Profile = &Profile;
+		RunParams.DeltaTime = DeltaTime;
+		const TArray<FTransform>& TargetGlobal = Processor.RunRetargeter(RunParams);
+
+		TArray<FTransform> TargetLocal = TargetGlobal;
+		Target.UpdateLocalTransformsBelowBone(0, TargetLocal, TargetGlobal);
+
+		for (int32 Bone = 0; Bone < NumTargetBones; ++Bone)
+		{
+			Tracks[Bone].PosKeys[Frame] = FVector3f(TargetLocal[Bone].GetLocation());
+			Tracks[Bone].RotKeys[Frame] = FQuat4f(TargetLocal[Bone].GetRotation().GetNormalized());
+			Tracks[Bone].ScaleKeys[Frame] = FVector3f(TargetLocal[Bone].GetScale3D());
+		}
+	}
+
+	UAnimSequence* Clip = NewObject<UAnimSequence>(GetTransientPackage(),
+		MakeUniqueObjectName(GetTransientPackage(), UAnimSequence::StaticClass(), FName(*(SourceSequence->GetName() + TEXT("_OnCharacter")))),
+		RF_Transient);
+	Clip->SetSkeleton(TargetMesh->GetSkeleton());
+
+	IAnimationDataController& Controller = Clip->GetController();
+	constexpr bool bShouldTransact = false;
+	Controller.OpenBracket(FText::FromString(TEXT("Retargeting a preview")), bShouldTransact);
+	Controller.InitializeModel();
+	Controller.SetFrameRate(SourceSequence->GetSamplingFrameRate(), bShouldTransact);
+	Controller.SetNumberOfFrames(FFrameNumber(FMath::Max(1, NumFrames - 1)), bShouldTransact);
+
+	for (int32 Bone = 0; Bone < NumTargetBones; ++Bone)
+	{
+		Controller.AddBoneCurve(Target.BoneNames[Bone], bShouldTransact);
+		Controller.SetBoneTrackKeys(Target.BoneNames[Bone], Tracks[Bone].PosKeys, Tracks[Bone].RotKeys, Tracks[Bone].ScaleKeys, bShouldTransact);
+	}
+
+	Controller.NotifyPopulated();
+	Controller.CloseBracket(bShouldTransact);
+
+	return Clip;
 }
 
 void UMotionForgeSubsystem::DeleteSourceClip(UAnimSequence* SourceSequence)
@@ -1686,11 +3155,8 @@ void UMotionForgeSubsystem::DeleteSourceClip(UAnimSequence* SourceSequence)
 
 	const FString Name = SourceSequence->GetName();
 
-	// Force-deleted, because the retargeter leaves a reference behind.
-	//
-	// `RunBatchRetarget` records the asset it came from, so an ordinary delete refuses on a live
-	// referencer and the clip stays in the project looking like the setting did nothing. The
-	// references being severed are exactly the ones being made obsolete.
+	// Force-deleted, because the retargeter leaves a reference behind: `RunBatchRetarget` records
+	// the asset it came from, so an ordinary delete refuses on a live referencer.
 	TArray<UObject*> ToDelete = { SourceSequence };
 
 	const int32 Deleted = ObjectTools::ForceDeleteObjects(ToDelete, /*ShowConfirmation*/ false);
@@ -1721,14 +3187,11 @@ void UMotionForgeSubsystem::ImportProviderCharacter(
 		return;
 	}
 
-	const FName ProviderId = Character->ProviderId.IsNone()
-		? UMotionForgeSettings::Get()->DefaultProviderId
-		: Character->ProviderId;
-
-	TSharedPtr<IMotionProvider> Provider = FindProvider(ProviderId);
+	TSharedPtr<IMotionProvider> Provider = FindProvider(Character->ProviderId);
 	if (!Provider.IsValid())
 	{
-		OnComplete(false, FString(), FString::Printf(TEXT("No provider registered as '%s'."), *ProviderId.ToString()));
+		OnComplete(false, FString(), FString::Printf(TEXT("No provider registered as '%s'."),
+			*ResolveProviderId(Character->ProviderId).ToString()));
 		return;
 	}
 
@@ -1780,18 +3243,463 @@ void UMotionForgeSubsystem::ImportProviderCharacter(
 		});
 }
 
+// -------------------------------------------------------------------------------------------------
+// Cancelling, hiding, and what is running
+// -------------------------------------------------------------------------------------------------
+
+void UMotionForgeSubsystem::SettleDefinition(UMotionDef* Def, const FString& Reason)
+{
+	if (Def == nullptr)
+	{
+		return;
+	}
+
+	// Takes still waiting are marked, not deleted. On a paid provider a submitted job may still finish
+	// and bill, and its record is the only trace of that.
+	for (FMotionCandidate& Candidate : Def->Candidates)
+	{
+		if (Candidate.Status == EMotionJobStatus::Pending || Candidate.Status == EMotionJobStatus::Running)
+		{
+			Candidate.Status = EMotionJobStatus::Failed;
+			Candidate.Error = TEXT("Stopped waiting before it finished. The provider may still complete it.");
+			Candidate.bLate = false;
+		}
+	}
+
+	if (Def->CountUsableCandidates() > 0)
+	{
+		Def->SetStatus(EMotionDefStatus::AwaitingReview);
+		Def->LastError = Reason;
+	}
+	else
+	{
+		Def->SetStatus(EMotionDefStatus::Failed, Reason);
+	}
+
+	Def->ActiveBatchId.Reset();
+	ClearActivity(Def->GetPathName());
+	SaveAsset(Def);
+}
+
 bool UMotionForgeSubsystem::CancelBatch(const FString& BatchId)
 {
-	if (FMotionBatch* Batch = Batches.Find(BatchId))
+	FMotionBatch* Batch = Batches.Find(BatchId);
+	if (!Batch)
 	{
-		Batch->bCancelled = true;
+		return false;
+	}
 
-		// Definitions are left where they are rather than reset. Their jobs keep running provider
-		// side and the motion ids are already recorded, so the work is recoverable.
-		UE_LOG(LogMotionForge, Log, TEXT("Batch %s cancelled - submitted jobs keep running."), *BatchId);
+	Batch->bCancelled = true;
+
+	// Every definition goes somewhere it can generate from again. Leaving them at Generating was a
+	// wedge only an editor restart undid.
+	for (const FString& Path : Batch->DefinitionPaths)
+	{
+		if (UMotionDef* Def = LoadDef(Path))
+		{
+			if (Def->IsBusy() && (Def->ActiveBatchId == BatchId || Def->ActiveBatchId.IsEmpty()))
+			{
+				SettleDefinition(Def, TEXT("Cancelled."));
+			}
+		}
+	}
+
+	UE_LOG(LogMotionForge, Log, TEXT("Batch %s cancelled. Submitted jobs may still finish on the provider."), *BatchId);
+	return true;
+}
+
+bool UMotionForgeSubsystem::CancelDefinition(const FString& AssetPath)
+{
+	UMotionDef* Def = LoadDef(AssetPath);
+	if (!Def || !Def->IsBusy())
+	{
+		return false;
+	}
+
+	const FString DefPath = Def->GetPathName();
+
+	// Its jobs stop being polled wherever they are; the rest of its batch carries on.
+	for (TPair<FString, FMotionBatch>& Pair : Batches)
+	{
+		for (FMotionJobTracking& Job : Pair.Value.Jobs)
+		{
+			if (Job.DefinitionPath == DefPath)
+			{
+				Job.bSettled = true;
+			}
+		}
+		Pair.Value.PendingSubmits.Remove(DefPath);
+	}
+
+	// Downloading and importing cannot be interrupted part way. Only the waiting can be.
+	if (Def->Status == EMotionDefStatus::Generating)
+	{
+		SettleDefinition(Def, TEXT("Cancelled."));
 		return true;
 	}
+
 	return false;
+}
+
+bool UMotionForgeSubsystem::HideTake(const FString& AssetPath, const FString& MotionId, bool bHidden)
+{
+	UMotionDef* Def = LoadDef(AssetPath);
+	if (!Def)
+	{
+		return false;
+	}
+
+	FMotionCandidate* Take = Def->FindCandidateMutable(MotionId);
+	if (!Take)
+	{
+		return false;
+	}
+
+	Def->Modify();
+	Take->bHidden = bHidden;
+	Def->MarkPackageDirty();
+	SaveAsset(Def);
+	return true;
+}
+
+void UMotionForgeSubsystem::SetActivity(const FString& AssetPath, const FString& Doing, bool bCanCancel)
+{
+	FMotionActivity& Activity = Activities.FindOrAdd(AssetPath);
+	Activity.AssetPath = AssetPath;
+	Activity.DefinitionName = FSoftObjectPath(AssetPath).GetAssetName();
+	Activity.Doing = Doing;
+	Activity.StartedAt = FDateTime::Now();
+	Activity.bCanCancel = bCanCancel;
+	Activity.bLate = false;
+	Activity.Done = 0;
+	Activity.Total = 0;
+}
+
+void UMotionForgeSubsystem::ClearActivity(const FString& AssetPath)
+{
+	Activities.Remove(AssetPath);
+}
+
+TArray<FMotionActivity> UMotionForgeSubsystem::GetActivities() const
+{
+	TArray<FMotionActivity> Out;
+	Activities.GenerateValueArray(Out);
+	Out.Sort([](const FMotionActivity& A, const FMotionActivity& B) { return A.StartedAt < B.StartedAt; });
+	return Out;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Previews
+// -------------------------------------------------------------------------------------------------
+
+bool UMotionForgeSubsystem::CanPreviewTake(const FString& AssetPath, const FString& MotionId, FString& OutWhyNot) const
+{
+	const UMotionDef* Def = LoadDef(AssetPath);
+	const FMotionCandidate* Take = Def ? Def->FindCandidate(MotionId) : nullptr;
+
+	if (!Take)
+	{
+		OutWhyNot = TEXT("No such take.");
+		return false;
+	}
+
+	if (!Take->IsUsable())
+	{
+		OutWhyNot = TEXT("It has not finished generating.");
+		return false;
+	}
+
+	if (!FindTakeFile(*Take).IsEmpty())
+	{
+		return true;
+	}
+
+	TSharedPtr<IMotionProvider> Provider = FindProvider(Take->ProviderId.IsNone() ? Def->ProviderId : Take->ProviderId);
+	if (!Provider.IsValid())
+	{
+		OutWhyNot = TEXT("The provider that made it is not installed.");
+		return false;
+	}
+
+	const FMotionBilling Billing = Provider->GetBilling();
+	if (!Billing.bFetchIsFree)
+	{
+		OutWhyNot = FString::Printf(
+			TEXT("Fetching a take from %s bills your plan, so it is not fetched just to look. Watch it on %s's site for free, or import it."),
+			*Provider->GetDisplayName(), *Provider->GetDisplayName());
+		return false;
+	}
+
+	// Said now rather than after a connection times out. The file is not here, so only the provider
+	// has it, and a stopped runner cannot hand anything over.
+	const FMotionProviderCaps Caps = Provider->GetCaps();
+	if (!Caps.SetupHint.IsEmpty())
+	{
+		const FString Surface = Provider->GetSetupSurfaceLabel().ToString();
+		OutWhyNot = FString::Printf(TEXT("The file is not on disk, and %s is not ready to send it. %s%s"),
+			*Provider->GetDisplayName(),
+			Caps.PrepareLabel.IsEmpty() ? *Caps.SetupHint : *FString::Printf(TEXT("%s first."), *Caps.PrepareLabel),
+			Surface.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" %s in the Generate card does it."), *Surface));
+		return false;
+	}
+
+	return true;
+}
+
+UAnimSequence* UMotionForgeSubsystem::FindPreview(const FString& AssetPath, const FString& MotionId) const
+{
+	const TObjectPtr<UAnimSequence>* Found = Previews.Find(AssetPath + TEXT("|") + MotionId);
+	return Found ? Found->Get() : nullptr;
+}
+
+FString UMotionForgeSubsystem::FindTakeFile(const FMotionCandidate& Take)
+{
+	if (!Take.bDownloaded || Take.LocalRawPath.IsEmpty())
+	{
+		return FString();
+	}
+
+	if (FPaths::FileExists(Take.LocalRawPath))
+	{
+		return Take.LocalRawPath;
+	}
+
+	const FString InStaging = UMotionForgeSettings::Get()->GetAbsoluteStagingDirectory() / FPaths::GetCleanFilename(Take.LocalRawPath);
+	return FPaths::FileExists(InStaging) ? InStaging : FString();
+}
+
+void UMotionForgeSubsystem::PreviewTake(
+	const FString& AssetPath,
+	const FString& MotionId,
+	TFunction<void(UAnimSequence*, const FString&)> OnReady)
+{
+	const FString Key = AssetPath + TEXT("|") + MotionId;
+
+	if (UAnimSequence* Cached = FindPreview(AssetPath, MotionId))
+	{
+		OnReady(Cached, FString());
+		return;
+	}
+
+	// Already being fetched for somebody else: wait for the same answer rather than fetching twice.
+	if (TArray<TFunction<void(UAnimSequence*, const FString&)>>* Waiting = PreviewWaiters.Find(Key))
+	{
+		Waiting->Add(MoveTemp(OnReady));
+		return;
+	}
+
+	FString WhyNot;
+	if (!CanPreviewTake(AssetPath, MotionId, WhyNot))
+	{
+		OnReady(nullptr, WhyNot);
+		return;
+	}
+
+	UMotionDef* Def = LoadDef(AssetPath);
+	const FMotionCandidate* Take = Def ? Def->FindCandidate(MotionId) : nullptr;
+	if (!Def || !Take)
+	{
+		OnReady(nullptr, TEXT("No such take."));
+		return;
+	}
+
+	TSharedPtr<IMotionProvider> Provider;
+	UMotionCharacter* Character = nullptr;
+	FString Error;
+	if (!ResolveTakeRoute(Def, *Take, Provider, Character, Error))
+	{
+		OnReady(nullptr, Error);
+		return;
+	}
+
+	PreviewWaiters.Add(Key).Add(MoveTemp(OnReady));
+
+	TWeakObjectPtr<UMotionForgeSubsystem> WeakThis(this);
+	const TWeakObjectPtr<UMotionCharacter> WeakCharacter = Character;
+	const FString Label = Take->GetLabel();
+	const FString DefName = Def->GetName();
+	const FVector2D Trim = Def->TrimWindow;
+
+	// Build, on the game thread, once the file is on disk.
+	const TWeakObjectPtr<UMotionDef> WeakDef = Def;
+	auto Build = [WeakThis, WeakDef, Key, Provider, WeakCharacter, Label, DefName, Trim](const FString& RawPath)
+	{
+		UMotionForgeSubsystem* Self = WeakThis.Get();
+		if (!Self)
+		{
+			return;
+		}
+
+		UAnimSequence* Clip = nullptr;
+		FString BuildError;
+
+		UMotionCharacter* Live = WeakCharacter.Get();
+		UMotionDef* LiveDef = WeakDef.Get();
+		USkeleton* Skeleton = Live ? Live->TargetSkeleton.LoadSynchronous() : nullptr;
+
+		// The route the import takes, so what plays here is what choosing the take would put in the
+		// game. A character with a provider rig gets the clip built on that rig and then retargeted;
+		// building straight onto its own skeleton instead showed a different result from the one an
+		// import produced - on a CC5 character, a torso leaning back that the import did not have.
+		USkeletalMesh* ProviderMesh = Live ? Live->ProviderMesh.LoadSynchronous() : nullptr;
+		const bool bRetargets = ProviderMesh && LiveDef
+			&& (!Live->Retargeter.IsNull() || !LiveDef->RetargeterOverride.IsNull());
+		USkeleton* BuildSkeleton = ProviderMesh && ProviderMesh->GetSkeleton() ? ProviderMesh->GetSkeleton() : Skeleton;
+
+		// A unique name each time: previews are transient and never collide with a real clip, and a
+		// second preview of another take must not overwrite the one somebody is comparing against.
+		static int32 Counter = 0;
+		const FString AssetName = ObjectTools::SanitizeObjectName(
+			FString::Printf(TEXT("Preview_%s_%s_%d"), *DefName, *Label.Replace(TEXT(" "), TEXT("")), ++Counter));
+
+		if (Skeleton == nullptr)
+		{
+			BuildError = TEXT("The character has no Target Skeleton to preview on.");
+		}
+		else if (Provider->HandlesImport())
+		{
+			FMotionArtifactImport Request;
+			Request.AbsoluteArtifactPath = RawPath;
+			Request.DestinationPackagePath = TEXT("/Temp/MotionForgePreview");
+			Request.AssetName = AssetName;
+			Request.TargetSkeleton = BuildSkeleton;
+			Request.TrimWindow = Trim;
+			Request.bZeroRootTranslation = false;
+			Request.bTransient = true;
+
+			const FMotionArtifactResult Result = Provider->ImportArtifact(Request);
+			Clip = Result.bSuccess ? Result.Sequence.Get() : nullptr;
+			BuildError = Result.Error;
+		}
+		else
+		{
+			// An FBX is imported into the transient root and never saved.
+			FMotionImportRequest Request;
+			Request.AbsoluteFbxPath = RawPath;
+			Request.DestinationPackagePath = TEXT("/Temp/MotionForgePreview");
+			Request.AssetName = AssetName;
+			Request.TargetSkeleton = BuildSkeleton;
+			Request.FrameRate = ResolveFrameRate(Provider);
+
+			const FMotionImportResult Result = FMotionImporter::Import(Request);
+			Clip = Result.bSuccess ? Result.Sequence.Get() : nullptr;
+			BuildError = Result.Error;
+
+			if (Clip)
+			{
+				Clip->ClearFlags(RF_Standalone | RF_Public);
+				Clip->SetFlags(RF_Transient);
+			}
+		}
+
+		// Then across, with the same retargeter the import uses, in memory: nothing written to the
+		// project and nothing saved.
+		if (Clip && bRetargets)
+		{
+			FString RetargetError;
+			UAnimSequence* Moved = Self->RetargetForPreview(LiveDef, Live, Clip, RetargetError);
+			Clip = Moved;
+			if (!Moved)
+			{
+				BuildError = RetargetError;
+			}
+		}
+
+		if (Clip)
+		{
+			Self->Previews.Add(Key, Clip);
+		}
+
+		TArray<TFunction<void(UAnimSequence*, const FString&)>> Waiters;
+		Self->PreviewWaiters.RemoveAndCopyValue(Key, Waiters);
+
+		for (TFunction<void(UAnimSequence*, const FString&)>& Waiter : Waiters)
+		{
+			Waiter(Clip, Clip ? FString() : (BuildError.IsEmpty() ? FString(TEXT("The preview could not be built.")) : BuildError));
+		}
+	};
+
+	const FString OnDisk = FindTakeFile(*Take);
+	if (!OnDisk.IsEmpty())
+	{
+		Build(OnDisk);
+		return;
+	}
+
+	// Fetched into staging exactly where an import would put it, and recorded on the take - so
+	// choosing it afterwards reuses the file instead of fetching again.
+	const FString RawPath = UMotionForgeSettings::Get()->GetAbsoluteStagingDirectory()
+		/ FString::Printf(TEXT("%s_%s_raw.%s"), *Def->GetName(), *MotionId, *Provider->GetArtifactExtension());
+
+	const UMotionCharacter* Maker = Cast<UMotionCharacter>(Take->Character.TryLoad());
+	const FString ProviderCharacterId = Maker ? Maker->ProviderCharacterId : Character->ProviderCharacterId;
+
+	Provider->DownloadMotion(ProviderCharacterId, MotionId, RawPath, ResolveFrameRate(Provider),
+		[WeakThis, AssetPath, MotionId, Key, RawPath, Build](bool bSuccess, const FString& DownloadError)
+		{
+			UMotionForgeSubsystem* Self = WeakThis.Get();
+			if (!Self)
+			{
+				return;
+			}
+
+			if (!bSuccess)
+			{
+				TArray<TFunction<void(UAnimSequence*, const FString&)>> Waiters;
+				Self->PreviewWaiters.RemoveAndCopyValue(Key, Waiters);
+				for (TFunction<void(UAnimSequence*, const FString&)>& Waiter : Waiters)
+				{
+					Waiter(nullptr, DownloadError);
+				}
+				return;
+			}
+
+			if (UMotionDef* LiveDef = Self->LoadDef(AssetPath))
+			{
+				if (FMotionCandidate* Candidate = LiveDef->FindCandidateMutable(MotionId))
+				{
+					Candidate->bDownloaded = true;
+					Candidate->LocalRawPath = RawPath;
+					LiveDef->MarkPackageDirty();
+				}
+			}
+
+			Build(RawPath);
+		});
+}
+
+TArray<FString> UMotionForgeSubsystem::GetClipUsers(const FString& AssetPath) const
+{
+	TArray<FString> Users;
+
+	const UMotionDef* Def = LoadDef(AssetPath);
+	if (!Def || Def->ImportedSequence.IsNull())
+	{
+		return Users;
+	}
+
+	const FAssetRegistryModule& Registry =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+
+	TArray<FName> Referencers;
+	Registry.Get().GetReferencers(FName(*Def->ImportedSequence.ToSoftObjectPath().GetLongPackageName()), Referencers);
+
+	const FString Own = Def->GetOutermost()->GetName();
+	for (const FName& Referencer : Referencers)
+	{
+		const FString Name = Referencer.ToString();
+
+		// The definition itself, and its prompt timeline, are not users: they are where it came from.
+		if (Name == Own || (!Def->Control.ConstraintSequence.IsNull()
+			&& Name == Def->Control.ConstraintSequence.ToSoftObjectPath().GetLongPackageName()))
+		{
+			continue;
+		}
+		Users.Add(FPackageName::GetShortName(Name));
+	}
+
+	Users.Sort();
+	return Users;
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1808,6 +3716,9 @@ TArray<FMotionDefinitionStatus> UMotionForgeSubsystem::GetStatus(const TArray<FS
 
 	TArray<FMotionDefinitionStatus> Result;
 	Result.Reserve(Paths.Num());
+
+	const FAssetRegistryModule& AssetRegistry =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
 
 	for (const FString& Path : Paths)
 	{
@@ -1832,20 +3743,19 @@ TArray<FMotionDefinitionStatus> UMotionForgeSubsystem::GetStatus(const TArray<FS
 		// definition with no provider - it follows the project default, and which one it landed on is
 		// the fact worth reporting.
 		Entry.bProviderInherited = Def->ProviderId.IsNone();
-		Entry.ProviderId = Entry.bProviderInherited
-			? UMotionForgeSettings::Get()->DefaultProviderId
-			: Def->ProviderId;
+		Entry.ProviderId = ResolveProviderId(Def->ProviderId);
 
 		// Ready with nothing to show for it. The status records what the pipeline did and stays true
 		// after the clip is deleted, so the registry is the only thing that knows.
 		if (!Entry.ImportedSequencePath.IsEmpty())
 		{
-			const FAssetRegistryModule& AssetRegistry =
-				FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
-
 			Entry.bImportedSequenceMissing =
 				!AssetRegistry.Get().GetAssetByObjectPath(FSoftObjectPath(Entry.ImportedSequencePath)).IsValid();
 		}
+
+		// The recipe the definition asks for now, so every take can say whether it still matches.
+		FMotionResolvedRequest Current;
+		ResolveInternal(Def, Current, nullptr, false);
 
 		Entry.Takes.Reserve(Def->Candidates.Num());
 		for (const FMotionCandidate& Candidate : Def->Candidates)
@@ -1855,8 +3765,19 @@ TArray<FMotionDefinitionStatus> UMotionForgeSubsystem::GetStatus(const TArray<FS
 			Take.Variant = Candidate.VariantIndex;
 			Take.Status = Candidate.Status;
 			Take.ViewerUrl = Candidate.ViewerUrl;
-			Take.bDownloaded = Candidate.bDownloaded;
+			// Whether the file is there now, not whether it once was.
+			Take.bDownloaded = !FindTakeFile(Candidate).IsEmpty();
 			Take.Error = Candidate.Error;
+			Take.Label = Candidate.GetLabel();
+			Take.ProviderId = Candidate.ProviderId;
+			Take.ModelId = Candidate.ModelId;
+			Take.Seed = Candidate.Seed;
+			Take.LengthSeconds = Candidate.LengthSeconds;
+			Take.bHidden = Candidate.bHidden;
+			Take.EstimatedCost = Candidate.EstimatedCost;
+			Take.bInGame = !Def->ImportedSequence.IsNull() && !Entry.bImportedSequenceMissing
+				&& !Candidate.MotionId.IsEmpty() && Candidate.MotionId == Def->ImportedMotionId;
+			Take.bStale = !Candidate.RecipeHash.IsEmpty() && Candidate.RecipeHash != Current.RecipeHash;
 			Entry.Takes.Add(MoveTemp(Take));
 		}
 
@@ -1875,8 +3796,7 @@ FMotionBatchStatus UMotionForgeSubsystem::GetBatchStatus(const FString& BatchId)
 	if (!Batch)
 	{
 		// A batch disappears once every job settles, so "unknown" and "finished" look the same from
-		// outside. Report finished rather than implying failure, and flag that it is untracked so a
-		// caller can tell the difference between "no jobs left" and "no such batch".
+		// outside. Report finished rather than implying failure, and flag that it is untracked.
 		Status.bTracked = false;
 		Status.bFinished = true;
 		return Status;
@@ -1895,35 +3815,10 @@ FMotionBatchStatus UMotionForgeSubsystem::GetBatchStatus(const FString& BatchId)
 	Status.Mode = Batch->Mode;
 	Status.JobsTotal = Batch->Jobs.Num();
 	Status.JobsSettled = Settled;
-	Status.bFinished = Batch->Jobs.Num() > 0 && Settled == Batch->Jobs.Num();
+	Status.bFinished = Batch->Jobs.Num() > 0 && Settled == Batch->Jobs.Num() && Batch->PendingPrepares == 0;
 	Status.bCancelled = Batch->bCancelled;
 	Status.DefinitionPaths = Batch->DefinitionPaths;
 	return Status;
-}
-
-void UMotionForgeSubsystem::ApplyBilling(FMotionCostEstimate& Estimate, bool bAnyMetered)
-{
-	const UMotionForgeSettings* Settings = UMotionForgeSettings::Get();
-
-	Estimate.BillingModel = Settings->BillingModel;
-
-	// A local provider bills nothing, so reporting a plan and a rate against it would be a lie with a
-	// number attached. The second counts stay - they are still the honest size of the work - but
-	// nothing is billed and nothing is owed.
-	if (!bAnyMetered)
-	{
-		Estimate.BilledSeconds = 0;
-		Estimate.EstimatedCost = 0.f;
-		Estimate.Currency = Settings->Currency;
-		return;
-	}
-	Estimate.Currency = Settings->Currency;
-
-	Estimate.BilledSeconds = Settings->BillingModel == EMotionBillingModel::PayPerGeneratedSecond
-		? Estimate.GeneratedSeconds
-		: Estimate.DownloadSeconds;
-
-	Estimate.EstimatedCost = Estimate.BilledSeconds * Settings->RatePerBilledSecond;
 }
 
 FMotionCostEstimate UMotionForgeSubsystem::EstimateCost(const TArray<FString>& AssetPaths, bool bSelectedOnly) const
@@ -1937,31 +3832,68 @@ FMotionCostEstimate UMotionForgeSubsystem::EstimateCost(const TArray<FString>& A
 	FMotionCostEstimate Estimate;
 	Estimate.bSelectedOnly = bSelectedOnly;
 
-	bool bAnyMetered = false;
+	// Fetching only, priced by the provider that made each take, in its own unit - a selection can
+	// span a free local runner, a rented pod and a paid service at once. What generating again would
+	// cost is a different question with its own answer: Preview Motion Request, or Estimate Generation
+	// Cost. Folding it in here once priced a free pay-as-you-go download at the generation rate.
+	struct FShare { FMotionBilling Billing; FString Name; float Downloaded = 0.f; };
+	TMap<FName, FShare> Shares;
 
 	for (const FString& Path : Paths)
 	{
-		if (const UMotionDef* Def = LoadDef(Path))
+		UMotionDef* Def = LoadDef(Path);
+		if (!Def)
 		{
-			const int32 Seconds = Def->EstimateDownloadSeconds(bSelectedOnly);
-			Estimate.DownloadSeconds += Seconds;
-			if (Seconds > 0)
+			continue;
+		}
+
+		auto AddDownload = [this, &Shares, &Estimate, Def](const FMotionCandidate& Take)
+		{
+			TSharedPtr<IMotionProvider> Maker = FindProvider(Take.ProviderId.IsNone() ? Def->ProviderId : Take.ProviderId);
+			if (!Maker.IsValid())
 			{
-				++Estimate.Clips;
+				return;
 			}
+			FShare& Share = Shares.FindOrAdd(Maker->GetProviderId());
+			Share.Billing = Maker->GetBilling();
+			Share.Name = Maker->GetDisplayName();
+			Share.Downloaded += Take.LengthSeconds > 0.f ? FMath::CeilToFloat(Take.LengthSeconds) : Def->Length;
+			++Estimate.Clips;
+		};
 
-			// What re-running Generate on this definition would produce, so the same call answers
-			// "what would fetching these cost" and "what would making them again cost".
-			Estimate.GeneratedSeconds += Def->Length * FMath::Max(1, Def->Variants);
-
-			if (TSharedPtr<IMotionProvider> Provider = FindProvider(Def->ProviderId))
+		// A file already on disk costs nothing to use again, wherever its recorded path points.
+		if (bSelectedOnly)
+		{
+			if (const FMotionCandidate* Selected = Def->FindSelectedCandidate())
 			{
-				bAnyMetered |= Provider->GetCaps().bIsMetered;
+				if (FindTakeFile(*Selected).IsEmpty())
+				{
+					AddDownload(*Selected);
+				}
+			}
+		}
+		else
+		{
+			for (const FMotionCandidate& Take : Def->Candidates)
+			{
+				if (Take.IsUsable() && FindTakeFile(Take).IsEmpty())
+				{
+					AddDownload(Take);
+				}
 			}
 		}
 	}
 
-	ApplyBilling(Estimate, bAnyMetered);
+	for (const TPair<FName, FShare>& Share : Shares)
+	{
+		AccumulateCost(Estimate, Share.Value.Billing, Share.Value.Name, /*Takes=*/0, /*Generated=*/0.f, Share.Value.Downloaded);
+	}
+
+	if (Estimate.Summary.IsEmpty())
+	{
+		Estimate.Summary = TEXT("Nothing to fetch: every take asked about is already on disk, so importing it costs nothing.");
+	}
+
 	return Estimate;
 }
 
@@ -1969,32 +3901,43 @@ FMotionCostEstimate UMotionForgeSubsystem::EstimateGenerationCost(const TArray<F
 {
 	FMotionCostEstimate Estimate;
 
-	bool bAnyMetered = false;
+	struct FShare { FMotionBilling Billing; FString Name; int32 Takes = 0; float Generated = 0.f; };
+	TMap<FName, FShare> Shares;
 
 	for (const FMotionDefSpec& Spec : Specs)
 	{
-		// Clamp the way submission will, or the estimate understates a four-second floor.
-		int32 Length = Spec.Length;
-
-		const FName ProviderId = Spec.ProviderId.IsNone()
-			? UMotionForgeSettings::Get()->DefaultProviderId
-			: Spec.ProviderId;
-
-		if (TSharedPtr<IMotionProvider> Provider = FindProvider(ProviderId))
+		TSharedPtr<IMotionProvider> Provider = FindProvider(Spec.ProviderId);
+		if (!Provider.IsValid())
 		{
-			int32 Min = 0;
-			int32 Max = 0;
-			Provider->GetLengthRange(Spec.ModelId, Min, Max);
-			Length = FMath::Clamp(Length, Min, Max);
-
-			bAnyMetered |= Provider->GetCaps().bIsMetered;
+			continue;
 		}
 
-		Estimate.GeneratedSeconds += Length * FMath::Max(1, Spec.Variants);
-		++Estimate.Clips;
+		// Clamp the way submission will, or the estimate understates a four-second floor.
+		float Length = Spec.Length > 0 ? Spec.Length : 5;
+		const FString ModelId = Spec.ModelId.IsEmpty() ? Provider->GetDefaultModelId() : Spec.ModelId;
+
+		for (const FMotionModelInfo& Model : Provider->GetModels())
+		{
+			if (Model.Id == ModelId)
+			{
+				Length = FMath::Clamp(Length, Model.MinSeconds, Model.MaxSeconds);
+			}
+		}
+
+		const int32 Takes = Spec.Variants > 0 ? Spec.Variants : 1;
+
+		FShare& Share = Shares.FindOrAdd(Provider->GetProviderId());
+		Share.Billing = Provider->GetBilling();
+		Share.Name = Provider->GetDisplayName();
+		Share.Takes += Takes;
+		Share.Generated += FMath::RoundToInt(Length) * Takes;
 	}
 
-	ApplyBilling(Estimate, bAnyMetered);
+	for (const TPair<FName, FShare>& Share : Shares)
+	{
+		AccumulateCost(Estimate, Share.Value.Billing, Share.Value.Name, Share.Value.Takes, Share.Value.Generated, 0.f);
+	}
+
 	return Estimate;
 }
 
@@ -2037,12 +3980,16 @@ FString UMotionForgeSubsystem::GetStatusJson(const TArray<FString>& AssetPaths) 
 		for (const FMotionTakeInfo& Take : Definition.Takes)
 		{
 			TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+			Object->SetStringField(TEXT("label"), Take.Label);
 			Object->SetStringField(TEXT("motionId"), Take.MotionId);
 			Object->SetNumberField(TEXT("variant"), Take.Variant);
 			Object->SetStringField(TEXT("status"), MotionForgeJson::JobStatusToString(Take.Status));
 			Object->SetStringField(TEXT("viewerUrl"), Take.ViewerUrl);
 			Object->SetBoolField(TEXT("downloaded"), Take.bDownloaded);
 			Object->SetStringField(TEXT("error"), Take.Error);
+			Object->SetNumberField(TEXT("seed"), Take.Seed);
+			Object->SetBoolField(TEXT("inGame"), Take.bInGame);
+			Object->SetBoolField(TEXT("stale"), Take.bStale);
 			TakeValues.Add(MakeShared<FJsonValueObject>(Object));
 		}
 		Entry->SetArrayField(TEXT("candidates"), TakeValues);
@@ -2094,11 +4041,12 @@ FString UMotionForgeSubsystem::EstimateCostJson(const TArray<FString>& AssetPath
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetBoolField(TEXT("ok"), true);
 	Root->SetNumberField(TEXT("downloadSeconds"), Estimate.DownloadSeconds);
+	Root->SetNumberField(TEXT("generatedSeconds"), Estimate.GeneratedSeconds);
+	Root->SetNumberField(TEXT("estimatedCost"), Estimate.EstimatedCost);
+	Root->SetStringField(TEXT("currency"), Estimate.Currency);
 	Root->SetNumberField(TEXT("clips"), Estimate.Clips);
 	Root->SetBoolField(TEXT("selectedOnly"), Estimate.bSelectedOnly);
-	Root->SetStringField(TEXT("note"),
-		TEXT("Seconds of motion that would be fetched. Already-downloaded takes are excluded. What a "
-			 "second costs depends on your plan."));
+	Root->SetStringField(TEXT("summary"), Estimate.Summary);
 	return MotionForgeJson::Serialize(Root);
 }
 
@@ -2126,7 +4074,9 @@ bool UMotionForgeSubsystem::SetCredential(FName ProviderId, const FString& Secre
 		return false;
 	}
 
-	return FMotionCredentialStore::Set(Provider->GetCredentialServiceName(), Secret);
+	const bool bStored = FMotionCredentialStore::Set(Provider->GetCredentialServiceName(), Secret);
+	NotifyProviderStateChanged(Provider->GetProviderId());
+	return bStored;
 }
 
 void UMotionForgeSubsystem::TestConnection(FName ProviderId)

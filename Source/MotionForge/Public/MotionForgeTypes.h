@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "MotionControl.h"
+#include "MotionPromptSequence.h"
 #include "MotionForgeTypes.generated.h"
 
 /**
@@ -116,7 +117,79 @@ struct MOTIONFORGE_API FMotionCandidate
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Candidate")
 	FString Error;
 
+	// ---------------------------------------------------------------------------------------------
+	// What made this take. Recorded at submission, so a take can be judged, imported and repeated
+	// without consulting the definition as it is now - which may have moved to another provider,
+	// another character or another prompt since.
+	// ---------------------------------------------------------------------------------------------
+
+	/** Numbered across every generation of the definition, so "Take 7" never repeats. Zero on takes made before numbering. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Candidate")
+	int32 TakeNumber = 0;
+
+	/** The provider that made it. Download and import go through this one, not the definition's current one. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Candidate")
+	FName ProviderId;
+
+	/** The model id that was sent. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Candidate")
+	FString ModelId;
+
+	/** The Motion Character it was generated for. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Candidate")
+	FSoftObjectPath Character;
+
+	/** The seed actually sent, variant walk included. -1 when the provider takes no seed. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Candidate")
+	int32 Seed = -1;
+
+	/** Seconds that were asked for. What a per-second provider bills. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Candidate")
+	float LengthSeconds = 0.f;
+
+	/** The prompt exactly as it was sent, beats joined. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Candidate")
+	FString PromptSent;
+
+	/** The settings that went with it, as the provider names them: "seed=812 diffusion_steps=100". */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Candidate")
+	FString SettingsSent;
+
+	/**
+	 * A fingerprint of everything that decides what comes back - prompt, beats, character, provider,
+	 * model and settings. When the definition's current fingerprint differs, the take is stale: it was
+	 * made from something the definition no longer asks for.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Candidate")
+	FString RecipeHash;
+
+	/** What it was estimated to cost when it was submitted. Zero where generation is free. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Candidate")
+	float EstimatedCost = 0.f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Candidate")
+	FString Currency;
+
+	/**
+	 * Put out of sight rather than deleted.
+	 *
+	 * A take cannot always be made again - a provider with no seed never repeats one - so the list only
+	 * ever hides, and Show Hidden brings a take back.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Candidate")
+	bool bHidden = false;
+
+	/** Past the job timeout and still being waited on, less often. Not a failure. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Candidate")
+	bool bLate = false;
+
 	bool IsValidCandidate() const { return !MotionId.IsEmpty(); }
+
+	/** Finished, with a motion to fetch. */
+	bool IsUsable() const { return Status == EMotionJobStatus::Finished && IsValidCandidate(); }
+
+	/** A name a person can read: "Take 7", or "Take 3b" for a take that predates numbering. */
+	FString GetLabel() const;
 };
 
 /**
@@ -134,12 +207,18 @@ struct MOTIONFORGE_API FMotionDefSpec
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec")
 	FString AssetName;
 
+	/** Empty leaves an existing definition's prompt as it is. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec", meta = (MultiLine = true))
 	FString Prompt;
 
-	/** Seconds. Clamped to whatever the chosen provider and model allow. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec")
-	int32 Length = 5;
+	/**
+	 * Seconds for the whole clip. Clamped to whatever the chosen provider and model allow.
+	 *
+	 * Zero means "not given": an update leaves the definition's length alone, and a new definition
+	 * gets five seconds.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec", meta = (ClampMin = 0))
+	int32 Length = 0;
 
 	/**
 	 * How many takes to generate.
@@ -147,23 +226,24 @@ struct MOTIONFORGE_API FMotionDefSpec
 	 * A spending decision wherever generated seconds are what bill: each variant is another
 	 * Length seconds charged at submission, kept or discarded. Free on a subscription.
 	 *
-	 * **Defaults to one**, so a caller that omits it cannot be charged a multiple it did not ask for.
-	 * Ask for more only after reading the provider's billing model - EstimateGenerationCost answers
-	 * before anything is submitted, and on an unmetered provider the answer is zero.
+	 * Zero means "not given": an update leaves the definition's count alone, and a new definition gets
+	 * **one**, so a caller that omits it cannot be charged a multiple it did not ask for. Ask for more
+	 * only after reading the provider's billing - Preview Motion Request and Estimate Generation Cost
+	 * both answer before anything is submitted.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec", meta = (ClampMin = 1))
-	int32 Variants = 1;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec", meta = (ClampMin = 0, ClampMax = 16))
+	int32 Variants = 0;
 
 	/**
-	 * Let the provider rewrite the prompt into its own phrasing before generating.
+	 * Deprecated: set the provider option `rewrite_prompt` in Pipeline Options instead.
 	 *
-	 * Improves results on some models and flattens deliberate phrasing on others, so it is worth
-	 * testing both ways per provider rather than assuming.
+	 * Still honoured when false, for callers written before providers declared their own options.
+	 * True is the default and changes nothing.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec")
 	bool bRewritePrompt = true;
 
-	/** Content path of the UMotionCharacter to generate for. Empty uses the settings default. */
+	/** Content path of the UMotionCharacter to generate for. Empty keeps the current one, or the default. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec")
 	FString CharacterAssetPath;
 
@@ -172,27 +252,49 @@ struct MOTIONFORGE_API FMotionDefSpec
 		meta = (GetOptions = "/Script/MotionForge.MotionForgeSettings.GetProviderOptions"))
 	FName ProviderId;
 
-	/** Empty uses the provider's default model. */
+	/**
+	 * The provider's model id. Empty keeps the pipeline's current model.
+	 *
+	 * Written into the provider's pipeline as its `model` option. A model the provider does not list
+	 * is refused rather than stored, because a model id is a provider's private vocabulary - Uthana's
+	 * name sent to Kimodo fails at the far end with nothing useful said.
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec")
 	FString ModelId;
 
 	/**
-	 * Seed, sampler settings and constraints. Leave alone to let the provider decide everything.
+	 * The provider's own settings, by the names List Pipeline Options reports: for Kimodo
+	 * `seed`, `diffusion_steps`, `cfg_type`, `cfg_text`, `cfg_constraint`, `postprocess`,
+	 * `split_prompt_into_beats`; for Uthana `rewrite_prompt`. Values as text: "812", "true", "separated".
 	 *
-	 * Ignored field by field on providers that cannot honour it - check Get Provider Capabilities
-	 * rather than assuming a seed took effect.
+	 * Only the keys given are changed, so an update can set one setting without restating the others.
+	 * A key the provider does not declare is refused and named.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec")
+	TMap<FString, FString> PipelineOptions;
+
+	/**
+	 * Constraints, beat durations and the prompt timeline.
+	 *
+	 * The authored half is applied field by field when it is filled in. Its sampler fields - seed,
+	 * steps, guidance, post-process, splitting - are still honoured for callers written before
+	 * Pipeline Options, and are written into the provider's pipeline.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec")
 	FMotionControl Control;
 
 	/**
-	 * Seconds to keep, as [start, end]. Zero-length means keep everything.
+	 * Seconds to keep, as [start, end]. Zero-length means "not given" and leaves the trim alone.
 	 *
 	 * Models with a minimum duration pad the action out to fill it, so most clips need topping and
-	 * tailing to land on the motion you actually asked for.
+	 * tailing to land on the motion you actually asked for. Set Clear Trim to remove one.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec")
 	FVector2D TrimWindow = FVector2D::ZeroVector;
+
+	/** Remove any trim, so the whole clip is kept. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec")
+	bool bClearTrim = false;
 };
 
 /** What a batch is doing, as returned by the status calls. */
@@ -256,13 +358,47 @@ struct MOTIONFORGE_API FMotionTakeInfo
 	UPROPERTY(BlueprintReadOnly, Category = "Take")
 	FString ViewerUrl;
 
-	/** True once fetched to the staging directory. Downloading it again costs nothing. */
+	/** True while the fetched file is on disk. Importing it or watching it costs nothing and needs no provider. */
 	UPROPERTY(BlueprintReadOnly, Category = "Take")
 	bool bDownloaded = false;
 
 	/** Provider error text when Status is Failed. */
 	UPROPERTY(BlueprintReadOnly, Category = "Take")
 	FString Error;
+
+	/** "Take 7". Numbered across every generation of the definition, so it never repeats. */
+	UPROPERTY(BlueprintReadOnly, Category = "Take")
+	FString Label;
+
+	/** The provider and model that made it, which may differ from the definition's current ones. */
+	UPROPERTY(BlueprintReadOnly, Category = "Take")
+	FName ProviderId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Take")
+	FString ModelId;
+
+	/** The seed that was sent, or -1. With the same prompt, model and settings it makes this take again. */
+	UPROPERTY(BlueprintReadOnly, Category = "Take")
+	int32 Seed = -1;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Take")
+	float LengthSeconds = 0.f;
+
+	/** The imported animation came from this take. */
+	UPROPERTY(BlueprintReadOnly, Category = "Take")
+	bool bInGame = false;
+
+	/** Made from a prompt, character, model or settings the definition no longer asks for. */
+	UPROPERTY(BlueprintReadOnly, Category = "Take")
+	bool bStale = false;
+
+	/** Hidden from the take list. Hide Take brings it back with Hidden false. */
+	UPROPERTY(BlueprintReadOnly, Category = "Take")
+	bool bHidden = false;
+
+	/** Estimated cost at submission. Zero where generation is free. */
+	UPROPERTY(BlueprintReadOnly, Category = "Take")
+	float EstimatedCost = 0.f;
 };
 
 /** A definition and everything the pipeline knows about it. */
@@ -363,6 +499,183 @@ enum class EMotionBillingModel : uint8
 	PayPerDownloadedSecond	UMETA(DisplayName = "Per Downloaded Second (subscription)")
 };
 
+/**
+ * What a provider charges for, as a unit. Declared by the provider, never assumed by the core.
+ *
+ * Each has its own right workflow, which is why the cost line says which one applies rather than
+ * printing a number: per generated second means few takes and download them all; per downloaded
+ * second means many takes and import only the keeper; per hour means the machine bills whether
+ * anything is generating or not.
+ */
+UENUM(BlueprintType)
+enum class EMotionBillingUnit : uint8
+{
+	/** Nothing is billed by the provider. A runner on this machine, or one somebody else pays for. */
+	Free					UMETA(DisplayName = "Free"),
+
+	/** Every take is billed for the seconds asked for, when it is submitted, kept or not. */
+	PerGeneratedSecond		UMETA(DisplayName = "Per generated second"),
+
+	/** Generation is free; fetching a take bills the seconds fetched. */
+	PerDownloadedSecond		UMETA(DisplayName = "Per downloaded second"),
+
+	/** A machine rented by the hour. It bills while it runs, generating or not. */
+	PerHour					UMETA(DisplayName = "Per hour")
+};
+
+/** How a provider bills right now. Returned by the provider; read by every cost line. */
+USTRUCT(BlueprintType)
+struct MOTIONFORGE_API FMotionBilling
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Billing")
+	EMotionBillingUnit Unit = EMotionBillingUnit::Free;
+
+	/** Money per unit: per second for the per-second units, per hour for Per Hour. Zero when unknown. */
+	UPROPERTY(BlueprintReadOnly, Category = "Billing")
+	float Rate = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Billing")
+	FString Currency = TEXT("USD");
+
+	/**
+	 * Money is being spent this minute whether or not anything generates - a rented machine that is up.
+	 *
+	 * The quiet cost. Nothing on screen looks busy, and the invoice still grows.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Billing")
+	bool bBillingNow = false;
+
+	/** The plan, in the provider's words: "pay as you go", "subscription", "rented GPU". */
+	UPROPERTY(BlueprintReadOnly, Category = "Billing")
+	FString PlanName;
+
+	/** One sentence a cost line can show as it is: "free, runs on this machine". */
+	UPROPERTY(BlueprintReadOnly, Category = "Billing")
+	FString Summary;
+
+	/**
+	 * Where Rate comes from, when it is not a figure the person entered: "Uthana's published price".
+	 * Empty when it is theirs. Cost lines show it beside the rate.
+	 *
+	 * **A price nobody entered must not read as theirs.** A provider that ships a list price as its
+	 * default otherwise states it in every confirmation exactly as it would a rate the person typed.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Billing")
+	FString RateNote;
+
+	/** A take can be fetched to watch in the editor without spending anything. */
+	UPROPERTY(BlueprintReadOnly, Category = "Billing")
+	bool bFetchIsFree = true;
+};
+
+/** One model a provider offers, and the lengths it can make. */
+USTRUCT(BlueprintType)
+struct MOTIONFORGE_API FMotionModelInfo
+{
+	GENERATED_BODY()
+
+	/** What is sent. The provider's own spelling. */
+	UPROPERTY(BlueprintReadOnly, Category = "Model")
+	FString Id;
+
+	/** A short note for the picker: what it is good at, or what licence it carries. */
+	UPROPERTY(BlueprintReadOnly, Category = "Model")
+	FString Description;
+
+	/** Shortest clip, in seconds. A model with a floor pads a shorter action out to fill it. */
+	UPROPERTY(BlueprintReadOnly, Category = "Model")
+	float MinSeconds = 1.f;
+
+	/** Longest clip, in seconds, across all of its beats. */
+	UPROPERTY(BlueprintReadOnly, Category = "Model")
+	float MaxSeconds = 10.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Model")
+	bool bDefault = false;
+};
+
+/**
+ * Whether a provider cuts a prompt into beats, and the limits that follow from it.
+ *
+ * Beat durations mean something only where this says the provider splits. Everywhere else the whole
+ * prompt is one generation of one length, and a beat total would be a number nobody asked for.
+ */
+USTRUCT(BlueprintType)
+struct MOTIONFORGE_API FMotionPromptSplitting
+{
+	GENERATED_BODY()
+
+	/** Cuts the prompt at every full stop and generates each piece in turn. */
+	UPROPERTY(BlueprintReadOnly, Category = "Prompt")
+	bool bSplitsAtFullStops = false;
+
+	/** Longest a single beat may be. The model's trained window; longer ones degrade. */
+	UPROPERTY(BlueprintReadOnly, Category = "Prompt")
+	float MaxBeatSeconds = 10.f;
+
+	/** Longest the whole clip may be, beats summed. */
+	UPROPERTY(BlueprintReadOnly, Category = "Prompt")
+	float MaxTotalSeconds = 10.f;
+};
+
+/** One setting a provider's pipeline declares, reflected for agents. */
+UENUM(BlueprintType)
+enum class EMotionOptionType : uint8
+{
+	Bool,
+	Int,
+	Float,
+	Enum,
+	Text
+};
+
+USTRUCT(BlueprintType)
+struct MOTIONFORGE_API FMotionPipelineOption
+{
+	GENERATED_BODY()
+
+	/** The provider's own name for it - what Pipeline Options and Set Motion Pipeline Option take. */
+	UPROPERTY(BlueprintReadOnly, Category = "Option")
+	FString Key;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Option")
+	EMotionOptionType Type = EMotionOptionType::Text;
+
+	/** What it does, what it costs, and what we measured. */
+	UPROPERTY(BlueprintReadOnly, Category = "Option")
+	FString Tooltip;
+
+	/** Its value on this definition, as text. */
+	UPROPERTY(BlueprintReadOnly, Category = "Option")
+	FString Value;
+
+	/** Its value on a fresh pipeline. */
+	UPROPERTY(BlueprintReadOnly, Category = "Option")
+	FString DefaultValue;
+
+	/** The choices, for an enum or a picked list. */
+	UPROPERTY(BlueprintReadOnly, Category = "Option")
+	TArray<FString> AllowedValues;
+
+	/** The lowest value it takes, as text. Empty when there is no lower bound. */
+	UPROPERTY(BlueprintReadOnly, Category = "Option")
+	FString Min;
+
+	/** The highest value it takes, as text. Empty when there is no upper bound. */
+	UPROPERTY(BlueprintReadOnly, Category = "Option")
+	FString Max;
+
+	/** Drawn under Advanced in the window. */
+	UPROPERTY(BlueprintReadOnly, Category = "Option")
+	bool bAdvanced = false;
+
+	/** Why it cannot be changed right now, when it cannot. */
+	UPROPERTY(BlueprintReadOnly, Category = "Option")
+	FString DisabledReason;
+};
+
 /** What an operation would cost, under whichever billing model is configured. */
 USTRUCT(BlueprintType)
 struct MOTIONFORGE_API FMotionCostEstimate
@@ -409,6 +722,29 @@ struct MOTIONFORGE_API FMotionCostEstimate
 	/** True when only chosen takes were counted rather than every usable one. */
 	UPROPERTY(BlueprintReadOnly, Category = "Cost")
 	bool bSelectedOnly = false;
+
+	/** The unit the money is in. Mixed selections report the most expensive unit involved. */
+	UPROPERTY(BlueprintReadOnly, Category = "Cost")
+	EMotionBillingUnit Unit = EMotionBillingUnit::Free;
+
+	/**
+	 * The whole answer in one sentence, for a cost line or a confirmation: "about $1.50: 3 takes x 5 s,
+	 * billed when submitted, kept or not". Per provider, joined, when a selection spans several.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Cost")
+	FString Summary;
+
+	/** Pressing the button spends money now. A person should be asked first. */
+	UPROPERTY(BlueprintReadOnly, Category = "Cost")
+	bool bSpendsMoney = false;
+
+	/** A rented machine is billing by the hour right now, whatever this operation does. */
+	UPROPERTY(BlueprintReadOnly, Category = "Cost")
+	bool bHourlyBillingNow = false;
+
+	/** The hourly rate of that machine, when there is one. */
+	UPROPERTY(BlueprintReadOnly, Category = "Cost")
+	float HourlyRate = 0.f;
 };
 
 /**
@@ -551,6 +887,37 @@ struct MOTIONFORGE_API FMotionProviderCaps
 	/** What a human must do before this provider will work, when it is not ready. Empty when it is. */
 	UPROPERTY(BlueprintReadOnly, Category = "Provider")
 	FString SetupHint;
+
+	/**
+	 * Not ready, but it can get itself ready - a stopped runner it can start. Generate then starts it
+	 * rather than refusing, and a window offers this label as its button.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Provider")
+	FString PrepareLabel;
+
+	/** The models it offers, with their lengths. */
+	UPROPERTY(BlueprintReadOnly, Category = "Provider")
+	TArray<FMotionModelInfo> Models;
+
+	/** Whether it cuts prompts into beats, and the beat limit. */
+	UPROPERTY(BlueprintReadOnly, Category = "Provider")
+	FMotionPromptSplitting PromptSplitting;
+
+	/** What it charges for, right now. */
+	UPROPERTY(BlueprintReadOnly, Category = "Provider")
+	FMotionBilling Billing;
+
+	/** The constraint types it honours. Empty means it takes none, and constraint tools are not offered. */
+	UPROPERTY(BlueprintReadOnly, Category = "Provider")
+	TArray<EMotionConstraintType> ConstraintTypes;
+
+	/** The settings class it declares, by path, so an agent can list its options. Empty when it has none. */
+	UPROPERTY(BlueprintReadOnly, Category = "Provider")
+	FString PipelineClass;
+
+	/** One line on what this provider is, for a person choosing between them. */
+	UPROPERTY(BlueprintReadOnly, Category = "Provider")
+	FString Tagline;
 };
 
 /**
@@ -566,10 +933,31 @@ enum class EMotionBlocker : uint8
 	None				UMETA(DisplayName = "None"),
 	NoProvider			UMETA(DisplayName = "No Provider"),
 	NoCredential		UMETA(DisplayName = "No Credential"),
+
+	/** Not ready, and a person has to act: install something, grant access, fix a broken image. */
 	ProviderNotReady	UMETA(DisplayName = "Provider Not Ready"),
+
 	NoCharacter			UMETA(DisplayName = "No Character"),
 	CharacterUnusable	UMETA(DisplayName = "Character Unusable"),
-	NoPrompt			UMETA(DisplayName = "No Prompt")
+	NoPrompt			UMETA(DisplayName = "No Prompt"),
+
+	/** The character was prepared for a different provider. Pick one that suits this provider. */
+	CharacterForOtherProvider	UMETA(DisplayName = "Character For Another Provider"),
+
+	/** The character retargets through a rig and the retargeter is missing. Caught before spending. */
+	RetargetIncomplete	UMETA(DisplayName = "Retarget Incomplete"),
+
+	/** The provider's own settings, or the beats, would be refused. Problem says which and why. */
+	InvalidRequest		UMETA(DisplayName = "Invalid Request"),
+
+	/** Asks for more seconds than the provider can make. */
+	LengthOutOfRange	UMETA(DisplayName = "Length Out Of Range"),
+
+	/** Not ready, but it can start itself - Generate does that first. Not a refusal. */
+	ProviderStartable	UMETA(DisplayName = "Provider Can Be Started"),
+
+	/** Already generating, downloading or importing. */
+	Busy				UMETA(DisplayName = "Busy")
 };
 
 /**
@@ -584,6 +972,10 @@ struct MOTIONFORGE_API FMotionReadiness
 {
 	GENERATED_BODY()
 
+	/**
+	 * Generate would do something useful now. True also when the provider must start first
+	 * (Blocker is Provider Startable) - pressing Generate starts it, then submits.
+	 */
 	UPROPERTY(BlueprintReadOnly, Category = "Readiness")
 	bool bCanGenerate = false;
 
@@ -593,6 +985,181 @@ struct MOTIONFORGE_API FMotionReadiness
 	/** What is missing, in one sentence. Empty when nothing is. */
 	UPROPERTY(BlueprintReadOnly, Category = "Readiness")
 	FString Problem;
+
+	/** Things worth knowing that do not stop a generation: a decimal point that will split a beat, poses a provider ignores. */
+	UPROPERTY(BlueprintReadOnly, Category = "Readiness")
+	TArray<FString> Warnings;
+
+	/** The button that fixes the blocker, when one can: "Start Kimodo runner", "Open Keys". Empty otherwise. */
+	UPROPERTY(BlueprintReadOnly, Category = "Readiness")
+	FString FixLabel;
+};
+
+/**
+ * Exactly what Generate would send, before anything is spent. The single source every surface reads:
+ * readiness, the cost line, the "will be sent" block, the confirmation, and the submission itself.
+ *
+ * One resolver, because two drifted. An estimate that prices one request while another is submitted
+ * is worse than no estimate - MeshForge once quoted fifteen credits for a job that cost thirty.
+ */
+USTRUCT(BlueprintType)
+struct MOTIONFORGE_API FMotionResolvedRequest
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	FString AssetPath;
+
+	/** The provider it goes to, resolved. */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	FName ProviderId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	FString ProviderDisplayName;
+
+	/** The definition names no provider and follows the project default. */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	bool bProviderInherited = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	FString ModelId;
+
+	/** The prompt as it will be sent, beats joined. */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	FString Prompt;
+
+	/** The prompt is read off a timeline rather than the text field. */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	bool bPromptFromTimeline = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	FString TimelinePath;
+
+	/** The beats and their seconds. Empty where the provider does not split, or durations are left to it. */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	TArray<FMotionPromptBeat> Beats;
+
+	/** How many beats the provider will find in the prompt. One where it does not split. */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	int32 BeatCount = 1;
+
+	/** The provider cuts this prompt at its full stops. */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	bool bSplitIntoBeats = false;
+
+	/** Seconds that will be asked for. */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	float LengthSeconds = 0.f;
+
+	/** Why the length is not what the definition says, when it is not: clamped, or taken from the beats. */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	FString LengthNote;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	int32 Variants = 1;
+
+	/** Seeds per take, as they will be sent. -1 entries mean "chosen at submission, and recorded on the take". */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	TArray<int32> Seeds;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	FString CharacterPath;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	FString CharacterName;
+
+	/** Where the motion lands: "direct onto SK_Mannequin", "retargeted from Kimodo's rig", "Uthana character 'Quinn'". */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	FString CharacterRoute;
+
+	/** The provider's settings as they will be sent, "key=value". */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	TArray<FString> Settings;
+
+	/** Where constraint poses come from and how many there are, in a sentence. Empty for a provider that takes none. */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	FString Constraints;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	FMotionCostEstimate Cost;
+
+	/** Nothing is stopping it. */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	bool bCanSubmit = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	FMotionReadiness Readiness;
+
+	/** Fingerprint of everything that decides what comes back. A take whose hash differs is stale. */
+	UPROPERTY(BlueprintReadOnly, Category = "Request")
+	FString RecipeHash;
+};
+
+/** What a definition is doing right now, for a job strip: one row per definition with work in flight. */
+USTRUCT(BlueprintType)
+struct MOTIONFORGE_API FMotionActivity
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Activity")
+	FString AssetPath;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Activity")
+	FString DefinitionName;
+
+	/** What is happening now, in words: "Starting the Kimodo runner", "Generating 3 takes", "Importing Take 7". */
+	UPROPERTY(BlueprintReadOnly, Category = "Activity")
+	FString Doing;
+
+	/** Takes finished of takes asked for, while generating. */
+	UPROPERTY(BlueprintReadOnly, Category = "Activity")
+	int32 Done = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Activity")
+	int32 Total = 0;
+
+	/** When this step started, for the clock. */
+	UPROPERTY(BlueprintReadOnly, Category = "Activity")
+	FDateTime StartedAt;
+
+	/** Taking longer than the timeout. Still waiting; not a failure. */
+	UPROPERTY(BlueprintReadOnly, Category = "Activity")
+	bool bLate = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Activity")
+	bool bCanCancel = false;
+};
+
+/** One step of a provider's own setup, as the Get Started page draws it. */
+USTRUCT(BlueprintType)
+struct MOTIONFORGE_API FMotionSetupStepInfo
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Setup")
+	FName ProviderId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Setup")
+	FString Label;
+
+	/** Done, Todo, Waiting, Blocked or Unknown. Unknown means it has not been measured - never assume either way. */
+	UPROPERTY(BlueprintReadOnly, Category = "Setup")
+	FString State;
+
+	/** What the state means, measured. */
+	UPROPERTY(BlueprintReadOnly, Category = "Setup")
+	FString Detail;
+
+	/** The button a person would press. Many are for a person only - a licence to accept, an app to install. */
+	UPROPERTY(BlueprintReadOnly, Category = "Setup")
+	FString ActionLabel;
+
+	/** Where the step happens outside the editor, when it does. */
+	UPROPERTY(BlueprintReadOnly, Category = "Setup")
+	FString HelpUrl;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Setup")
+	bool bOptional = false;
 };
 
 /** Whether a provider can be used, without revealing how. */
@@ -607,7 +1174,7 @@ struct MOTIONFORGE_API FMotionCredentialInfo
 	UPROPERTY(BlueprintReadOnly, Category = "Credential")
 	FString DisplayName;
 
-	/** False means generation will fail until a human signs in through Project Settings. */
+	/** False means generation will fail until a person sets the key on the Keys page or in Editor Preferences. */
 	UPROPERTY(BlueprintReadOnly, Category = "Credential")
 	bool bConfigured = false;
 

@@ -38,7 +38,7 @@ public:
 	 * empty means the provider generates against its own default character, which will import onto a
 	 * skeleton that probably is not yours.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Character")
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, AssetRegistrySearchable, Category = "Character")
 	FString ProviderCharacterId;
 
 	/**
@@ -50,7 +50,7 @@ public:
 	 * Pairing checklist at the top of this asset says which provider it resolved to, and whether
 	 * that was chosen or inherited.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Character",
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, AssetRegistrySearchable, Category = "Character",
 		meta = (GetOptions = "/Script/MotionForge.MotionForgeSettings.GetProviderOptions"))
 	FName ProviderId;
 

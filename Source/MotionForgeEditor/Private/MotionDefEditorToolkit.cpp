@@ -2,17 +2,19 @@
 
 #include "MotionDefEditorToolkit.h"
 
-#include "MotionDefDetails.h"
-#include "SMotionDefTakes.h"
+#include "MotionForgeEditorModule.h"
+#include "SMotionGeneratePanel.h"
+#include "SMotionHome.h"
+#include "SMotionTakesPanel.h"
 
 #include "MotionDef.h"
 #include "MotionForgeSubsystem.h"
 
 #include "Animation/AnimSequence.h"
+#include "AssetRegistry/AssetRegistryModule.h"
 #include "Editor.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "Framework/MultiBox/MultiBoxExtender.h"
-#include "Framework/Notifications/NotificationManager.h"
 #include "IDetailsView.h"
 #include "LevelSequence.h"
 #include "Modules/ModuleManager.h"
@@ -20,28 +22,26 @@
 #include "Styling/AppStyle.h"
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "Widgets/Docking/SDockTab.h"
-#include "Widgets/Notifications/SNotificationList.h"
-#include "WorkspaceMenuStructure.h"
-#include "WorkspaceMenuStructureModule.h"
 
 #define LOCTEXT_NAMESPACE "MotionForgeEditor"
 
 const FName FMotionDefEditorToolkit::ToolkitName(TEXT("MotionDefEditor"));
-const FName FMotionDefEditorToolkit::DetailsTabId(TEXT("MotionDefEditor_Details"));
 const FName FMotionDefEditorToolkit::TakesTabId(TEXT("MotionDefEditor_Takes"));
+const FName FMotionDefEditorToolkit::RecordTabId(TEXT("MotionDefEditor_Record"));
+const FName FMotionDefEditorToolkit::GenerateTabId(TEXT("MotionDefEditor_Generate"));
+const FName FMotionDefEditorToolkit::SettingsTabId(TEXT("MotionDefEditor_Settings"));
 
 namespace
 {
 	/**
-	 * Everything under "State" is drawn by the takes panel, in a form a person can act on.
-	 *
-	 * Leaving it in the details view as well would show the same facts twice, once well and once as a
-	 * read-only enum beside a collapsed array - and the collapsed array is exactly the surface this
-	 * window exists to replace.
+	 * The Settings tab is every authoring field; pipeline state and bookkeeping are drawn properly by
+	 * the takes panel, and each provider's settings by the Generate card.
 	 */
 	bool IsAuthoringProperty(const FPropertyAndParent& PropertyAndParent)
 	{
-		return PropertyAndParent.Property.GetMetaData(TEXT("Category")) != TEXT("State");
+		const FString Category = PropertyAndParent.Property.GetMetaData(TEXT("Category"));
+		return Category != TEXT("State") && Category != TEXT("Result")
+			&& PropertyAndParent.Property.GetFName() != GET_MEMBER_NAME_CHECKED(UMotionDef, Pipelines);
 	}
 }
 
@@ -63,17 +63,16 @@ void FMotionDefEditorToolkit::Initialise(
 
 	DetailsView = PropertyModule.CreateDetailView(Args);
 	DetailsView->SetIsPropertyVisibleDelegate(FIsPropertyVisible::CreateStatic(&IsAuthoringProperty));
-
-	// Per-instance rather than registered globally: this shapes the definition window, and a details
-	// panel somewhere else showing the same asset should still show it plainly.
-	DetailsView->RegisterInstancedCustomPropertyLayout(
-		UMotionDef::StaticClass(),
-		FOnGetDetailCustomizationInstance::CreateStatic(&FMotionDefDetails::MakeInstance));
-
 	DetailsView->SetObject(InDef);
 
+	// Built before the tabs spawn: the Record tab reads the takes panel's selection.
+	TakesPanel = SNew(SMotionTakesPanel).Definition(InDef);
+	GeneratePanel = SNew(SMotionGeneratePanel).Definition(InDef);
+
+	// Renamed from v1 on purpose: Unreal remembers a layout by its name, and a v1 layout restored over
+	// this one would put the old tabs back.
 	const TSharedRef<FTabManager::FLayout> Layout =
-		FTabManager::NewLayout("MotionDefEditor_v1")
+		FTabManager::NewLayout("MotionDefEditor_v2")
 		->AddArea
 		(
 			FTabManager::NewPrimaryArea()
@@ -85,16 +84,18 @@ void FMotionDefEditorToolkit::Initialise(
 				->Split
 				(
 					FTabManager::NewStack()
-					->SetSizeCoefficient(0.55f)
-					->AddTab(DetailsTabId, ETabState::OpenedTab)
-					->SetHideTabWell(true)
+					->SetSizeCoefficient(0.62f)
+					->AddTab(TakesTabId, ETabState::OpenedTab)
+					->AddTab(RecordTabId, ETabState::OpenedTab)
+					->SetForegroundTab(TakesTabId)
 				)
 				->Split
 				(
 					FTabManager::NewStack()
-					->SetSizeCoefficient(0.45f)
-					->AddTab(TakesTabId, ETabState::OpenedTab)
-					->SetHideTabWell(true)
+					->SetSizeCoefficient(0.38f)
+					->AddTab(GenerateTabId, ETabState::OpenedTab)
+					->AddTab(SettingsTabId, ETabState::OpenedTab)
+					->SetForegroundTab(GenerateTabId)
 				)
 			)
 		);
@@ -121,15 +122,23 @@ void FMotionDefEditorToolkit::RegisterTabSpawners(const TSharedRef<FTabManager>&
 
 	const TSharedRef<FWorkspaceItem> Category = WorkspaceMenuCategory.ToSharedRef();
 
-	InTabManager->RegisterTabSpawner(DetailsTabId,
-		FOnSpawnTab::CreateSP(this, &FMotionDefEditorToolkit::SpawnDetailsTab))
-		.SetDisplayName(LOCTEXT("DetailsTab", "Definition"))
-		.SetGroup(Category)
-		.SetIcon(FSlateIcon(FAppStyle::GetAppStyleSetName(), "LevelEditor.Tabs.Details"));
-
-	InTabManager->RegisterTabSpawner(TakesTabId,
-		FOnSpawnTab::CreateSP(this, &FMotionDefEditorToolkit::SpawnTakesTab))
+	InTabManager->RegisterTabSpawner(TakesTabId, FOnSpawnTab::CreateSP(this, &FMotionDefEditorToolkit::SpawnTakesTab))
 		.SetDisplayName(LOCTEXT("TakesTab", "Takes"))
+		.SetGroup(Category)
+		.SetIcon(FSlateIcon(FAppStyle::GetAppStyleSetName(), "ClassIcon.AnimSequence"));
+
+	InTabManager->RegisterTabSpawner(RecordTabId, FOnSpawnTab::CreateSP(this, &FMotionDefEditorToolkit::SpawnRecordTab))
+		.SetDisplayName(LOCTEXT("RecordTab", "Record"))
+		.SetGroup(Category)
+		.SetIcon(FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Info"));
+
+	InTabManager->RegisterTabSpawner(GenerateTabId, FOnSpawnTab::CreateSP(this, &FMotionDefEditorToolkit::SpawnGenerateTab))
+		.SetDisplayName(LOCTEXT("GenerateTab", "Generate"))
+		.SetGroup(Category)
+		.SetIcon(FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Play"));
+
+	InTabManager->RegisterTabSpawner(SettingsTabId, FOnSpawnTab::CreateSP(this, &FMotionDefEditorToolkit::SpawnSettingsTab))
+		.SetDisplayName(LOCTEXT("SettingsTab", "Settings"))
 		.SetGroup(Category)
 		.SetIcon(FSlateIcon(FAppStyle::GetAppStyleSetName(), "LevelEditor.Tabs.Details"));
 }
@@ -138,26 +147,30 @@ void FMotionDefEditorToolkit::UnregisterTabSpawners(const TSharedRef<FTabManager
 {
 	FAssetEditorToolkit::UnregisterTabSpawners(InTabManager);
 
-	InTabManager->UnregisterTabSpawner(DetailsTabId);
 	InTabManager->UnregisterTabSpawner(TakesTabId);
-}
-
-TSharedRef<SDockTab> FMotionDefEditorToolkit::SpawnDetailsTab(const FSpawnTabArgs&)
-{
-	return SNew(SDockTab)
-		.Label(LOCTEXT("DetailsTab", "Definition"))
-		[
-			DetailsView.ToSharedRef()
-		];
+	InTabManager->UnregisterTabSpawner(RecordTabId);
+	InTabManager->UnregisterTabSpawner(GenerateTabId);
+	InTabManager->UnregisterTabSpawner(SettingsTabId);
 }
 
 TSharedRef<SDockTab> FMotionDefEditorToolkit::SpawnTakesTab(const FSpawnTabArgs&)
 {
-	return SNew(SDockTab)
-		.Label(LOCTEXT("TakesTab", "Takes"))
-		[
-			SAssignNew(TakesPanel, SMotionDefTakes).Definition(Definition)
-		];
+	return SNew(SDockTab).Label(LOCTEXT("TakesTab", "Takes"))[ TakesPanel.ToSharedRef() ];
+}
+
+TSharedRef<SDockTab> FMotionDefEditorToolkit::SpawnRecordTab(const FSpawnTabArgs&)
+{
+	return SNew(SDockTab).Label(LOCTEXT("RecordTab", "Record"))[ TakesPanel->GetRecordWidget() ];
+}
+
+TSharedRef<SDockTab> FMotionDefEditorToolkit::SpawnGenerateTab(const FSpawnTabArgs&)
+{
+	return SNew(SDockTab).Label(LOCTEXT("GenerateTab", "Generate"))[ GeneratePanel.ToSharedRef() ];
+}
+
+TSharedRef<SDockTab> FMotionDefEditorToolkit::SpawnSettingsTab(const FSpawnTabArgs&)
+{
+	return SNew(SDockTab).Label(LOCTEXT("SettingsTab", "Settings"))[ DetailsView.ToSharedRef() ];
 }
 
 FName FMotionDefEditorToolkit::GetToolkitFName() const          { return ToolkitName; }
@@ -166,7 +179,7 @@ FString FMotionDefEditorToolkit::GetWorldCentricTabPrefix() const { return LOCTE
 FLinearColor FMotionDefEditorToolkit::GetWorldCentricTabColorScale() const { return FLinearColor(0.36f, 0.52f, 0.86f, 0.5f); }
 
 // -------------------------------------------------------------------------------------------------
-// The toolbar
+// The toolbar: navigation. The verbs are in the cards, beside what they act on.
 // -------------------------------------------------------------------------------------------------
 
 void FMotionDefEditorToolkit::ExtendToolbar()
@@ -184,40 +197,7 @@ void FMotionDefEditorToolkit::ExtendToolbar()
 
 void FMotionDefEditorToolkit::FillToolbar(FToolBarBuilder& Builder)
 {
-	Builder.BeginSection(TEXT("MotionForge"));
-
-	Builder.AddToolBarButton(
-		FUIAction(
-			FExecuteAction::CreateSP(this, &FMotionDefEditorToolkit::OnGenerate),
-			FCanExecuteAction::CreateSP(this, &FMotionDefEditorToolkit::CanGenerate)),
-		NAME_None,
-		LOCTEXT("Generate", "Generate"),
-		TAttribute<FText>::CreateSP(this, &FMotionDefEditorToolkit::GenerateTooltip),
-		FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Play"));
-
-	Builder.AddToolBarButton(
-		FUIAction(
-			FExecuteAction::CreateSP(this, &FMotionDefEditorToolkit::OnImportChosen),
-			FCanExecuteAction::CreateSP(this, &FMotionDefEditorToolkit::CanImportChosen)),
-		NAME_None,
-		TAttribute<FText>::CreateSP(this, &FMotionDefEditorToolkit::ImportLabel),
-		TAttribute<FText>::CreateSP(this, &FMotionDefEditorToolkit::ImportTooltip),
-		FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Import"));
-
-	Builder.EndSection();
-
 	Builder.BeginSection(TEXT("MotionForgeNavigate"));
-
-	Builder.AddToolBarButton(
-		FUIAction(FExecuteAction::CreateSP(this, &FMotionDefEditorToolkit::OnOpenPromptSequence)),
-		NAME_None,
-		LOCTEXT("PromptSequence", "Prompt Timeline"),
-		LOCTEXT("PromptSequenceTip",
-			"Lay the prompt out as beats on a Level Sequence, where their durations are visible and "
-			"can be dragged. Creates the sequence the first time.\n\n"
-			"While a prompt sequence exists it is the prompt - the text field below is left alone "
-			"underneath it."),
-		FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Edit"));
 
 	Builder.AddToolBarButton(
 		FUIAction(
@@ -225,189 +205,81 @@ void FMotionDefEditorToolkit::FillToolbar(FToolBarBuilder& Builder)
 			FCanExecuteAction::CreateSP(this, &FMotionDefEditorToolkit::CanShowAnimation)),
 		NAME_None,
 		LOCTEXT("ShowAnimation", "Show Animation"),
-		LOCTEXT("ShowAnimationTip", "Find the imported animation sequence in the Content Browser."),
+		TAttribute<FText>::CreateSP(this, &FMotionDefEditorToolkit::ShowAnimationTooltip),
 		FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Search"));
 
+	Builder.AddToolBarButton(
+		FUIAction(FExecuteAction::CreateSP(this, &FMotionDefEditorToolkit::OnOpenPromptSequence)),
+		NAME_None,
+		LOCTEXT("PromptTimeline", "Prompt Timeline"),
+		LOCTEXT("PromptTimelineTip",
+			"The prompt as beats on a Level Sequence, where their durations can be dragged, with the character "
+			"and its Control Rig to pose. Made the first time. While it exists, the timeline is the prompt."),
+		FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Edit"));
+
+	Builder.AddToolBarButton(
+		FUIAction(FExecuteAction::CreateSP(this, &FMotionDefEditorToolkit::OnOpenLibrary)),
+		NAME_None,
+		LOCTEXT("OpenLibrary", "Motion Library"),
+		LOCTEXT("OpenLibraryTip", "Every definition in the project, the providers' setup, and where to start."),
+		FSlateIcon(FAppStyle::GetAppStyleSetName(), "ClassIcon.AnimSequence"));
+
 	Builder.EndSection();
-}
-
-// -------------------------------------------------------------------------------------------------
-// The verbs. Each is one subsystem call; none of them decides anything.
-// -------------------------------------------------------------------------------------------------
-
-bool FMotionDefEditorToolkit::CanGenerate() const
-{
-	const UMotionDef* D = Def();
-	if (!D || D->IsBusy())
-	{
-		return false;
-	}
-
-	// And only when it would actually work. Offering Generate to a definition with no character,
-	// no key or a runner that is down is a button that cannot do what it says - the panel is
-	// already saying what is missing, and the two must not disagree.
-	//
-	// Read from the panel's cache rather than asked here: the check touches the credential vault
-	// and this runs every frame.
-	return !TakesPanel.IsValid() || TakesPanel->Readiness().bCanGenerate;
-}
-
-void FMotionDefEditorToolkit::OnGenerate()
-{
-	UMotionDef* D = Def();
-	UMotionForgeSubsystem* Subsystem = UMotionForgeSubsystem::Get();
-
-	if (D && Subsystem)
-	{
-		Subsystem->Generate({ D->GetPathName() });
-
-		if (TakesPanel.IsValid())
-		{
-			TakesPanel->Refresh();
-		}
-	}
-}
-
-bool FMotionDefEditorToolkit::CanImportChosen() const
-{
-	const UMotionDef* D = Def();
-	if (!D || D->IsBusy() || D->SelectedMotionId.IsEmpty())
-	{
-		return false;
-	}
-
-	const FMotionCandidate* Chosen = D->FindSelectedCandidate();
-	return Chosen && Chosen->Status == EMotionJobStatus::Finished;
-}
-
-void FMotionDefEditorToolkit::OnImportChosen()
-{
-	UMotionDef* D = Def();
-	UMotionForgeSubsystem* Subsystem = UMotionForgeSubsystem::Get();
-
-	if (D && Subsystem)
-	{
-		Subsystem->DownloadSelected({ D->GetPathName() });
-
-		if (TakesPanel.IsValid())
-		{
-			TakesPanel->Refresh();
-		}
-	}
-}
-
-FText FMotionDefEditorToolkit::GenerateTooltip() const
-{
-	static const FText Normal = LOCTEXT("GenerateTip",
-		"Submit this definition to its provider. A definition already generating is skipped "
-		"rather than charged a second time.\n\n"
-		"What it costs is on the takes panel, beside the takes it would add to.");
-
-	if (TakesPanel.IsValid() && !TakesPanel->Readiness().bCanGenerate
-		&& !TakesPanel->Readiness().Problem.IsEmpty())
-	{
-		return FText::Format(
-			LOCTEXT("GenerateBlockedFmt", "Cannot generate yet.\n\n{0}"),
-			FText::FromString(TakesPanel->Readiness().Problem));
-	}
-
-	return Normal;
-}
-
-FText FMotionDefEditorToolkit::ImportLabel() const
-{
-	UMotionForgeSubsystem* Subsystem = UMotionForgeSubsystem::Get();
-	const UMotionDef* D = Def();
-
-	if (Subsystem && D)
-	{
-		const FMotionProviderCaps Caps = Subsystem->GetProviderCaps(D->ProviderId);
-
-		// On a subscription the download is the spend, and the label should say so before it is
-		// pressed. On pay-as-you-go the money went at generation and this is free.
-		if (Caps.bIsMetered && !Caps.bIsLocal)
-		{
-			return LOCTEXT("ImportPaid", "Download && Import");
-		}
-	}
-
-	return LOCTEXT("Import", "Import Take");
-}
-
-FText FMotionDefEditorToolkit::ImportTooltip() const
-{
-	UMotionForgeSubsystem* Subsystem = UMotionForgeSubsystem::Get();
-	const UMotionDef* D = Def();
-
-	if (!Subsystem || !D)
-	{
-		return LOCTEXT("ImportTipPlain", "Fetch the chosen take and import it.");
-	}
-
-	const FMotionCostEstimate Estimate = Subsystem->EstimateCost({ D->GetPathName() }, /*bSelectedOnly*/ true);
-
-	if (Estimate.DownloadSeconds == 0)
-	{
-		return LOCTEXT("ImportTipCached",
-			"Fetch the chosen take, normalise it, and import it onto the character's skeleton.\n\n"
-			"This take is already on disk, so fetching it again costs nothing.");
-	}
-
-	return FText::Format(
-		LOCTEXT("ImportTipCostFmt",
-			"Fetch the chosen take, normalise it, and import it onto the character's skeleton.\n\n"
-			"{0} seconds would be downloaded."),
-		FText::AsNumber(Estimate.DownloadSeconds));
 }
 
 void FMotionDefEditorToolkit::OnOpenPromptSequence()
 {
 	UMotionDef* D = Def();
 	UMotionForgeSubsystem* Subsystem = UMotionForgeSubsystem::Get();
-
 	if (!D || !Subsystem)
 	{
 		return;
 	}
 
 	// Already laid out: open what exists rather than re-laying it out, which would replace beats
-	// somebody may have spent time retiming.
+	// somebody may have spent time retiming. The take row is refreshed every time.
 	if (ULevelSequence* Existing = D->Control.ConstraintSequence.LoadSynchronous())
 	{
-		// The animation row, though, is refreshed every time. A sequence built before the clip was
-		// imported has an empty one, and a sequence built before a different take was chosen has a
-		// stale one - and an empty row beside the beats that produced it is the one thing this
-		// timeline exists to avoid.
 		FString RefreshError;
 		Subsystem->RefreshPromptSequenceTake(D->GetPathName(), RefreshError);
-
 		GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(Existing);
 		return;
 	}
 
 	FString Error;
 	const FString Created = Subsystem->CreatePromptSequence(D->GetPathName(), FString(), Error);
-
-	if (Created.IsEmpty())
+	if (!Created.IsEmpty())
 	{
-		FNotificationInfo Info(FText::Format(
-			LOCTEXT("PromptSequenceFailedFmt", "Could not create a prompt sequence: {0}"),
-			FText::FromString(Error)));
-		Info.ExpireDuration = 6.f;
-		FSlateNotificationManager::Get().AddNotification(Info);
-		return;
-	}
-
-	if (UObject* Sequence = LoadObject<UObject>(nullptr, *Created))
-	{
-		GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(Sequence);
+		if (UObject* Sequence = LoadObject<UObject>(nullptr, *Created))
+		{
+			GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(Sequence);
+		}
 	}
 }
 
 bool FMotionDefEditorToolkit::CanShowAnimation() const
 {
 	const UMotionDef* D = Def();
-	return D && !D->ImportedSequence.IsNull();
+	if (!D || D->ImportedSequence.IsNull())
+	{
+		return false;
+	}
+
+	// Checked, not believed: a deleted clip leaves the soft pointer set.
+	const FAssetRegistryModule& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+	return Registry.Get().GetAssetByObjectPath(D->ImportedSequence.ToSoftObjectPath()).IsValid();
+}
+
+FText FMotionDefEditorToolkit::ShowAnimationTooltip() const
+{
+	const UMotionDef* D = Def();
+	if (!D || D->ImportedSequence.IsNull())
+	{
+		return LOCTEXT("ShowAnimNone", "Nothing imported yet. Choose and import a take first.");
+	}
+	return CanShowAnimation()
+		? LOCTEXT("ShowAnimTip", "Find the imported animation in the Content Browser.")
+		: LOCTEXT("ShowAnimGone", "The imported animation was deleted. Choose and import a take to make it again.");
 }
 
 void FMotionDefEditorToolkit::OnShowAnimation()
@@ -423,6 +295,11 @@ void FMotionDefEditorToolkit::OnShowAnimation()
 		TArray<UObject*> Objects{ Sequence };
 		GEditor->SyncBrowserToObjects(Objects);
 	}
+}
+
+void FMotionDefEditorToolkit::OnOpenLibrary()
+{
+	SMotionHome::Open(EMotionHomePage::Library);
 }
 
 #undef LOCTEXT_NAMESPACE

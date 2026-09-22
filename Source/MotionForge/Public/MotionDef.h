@@ -8,6 +8,7 @@
 #include "MotionDef.generated.h"
 
 class UMotionCharacter;
+class UMotionPipeline;
 class UIKRetargeter;
 class UAnimSequence;
 
@@ -32,104 +33,101 @@ public:
 	// Authoring - edit these, then generate
 	// ---------------------------------------------------------------------------------------------
 
+	// Tooltips below are what a person reads in the Settings tab; the reasoning for maintainers stays in
+	// `//` comments where no tooltip can pick it up (PANEL_RULES 21).
+
 	/**
-	 * What the motion should be.
-	 *
-	 * Models with a minimum clip length spend the whole duration whether or not you tell them how, so
-	 * an underspecified prompt comes back padded and lifeless. Describe beats, give each its own
-	 * tempo, and say how the motion ends.
+	 * What the motion should be. Start with "A person", describe one or two actions, and say how the
+	 * motion ends. On a provider that splits prompts, every full stop starts a new beat.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion", meta = (MultiLine = true))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "1 Prompt", meta = (MultiLine = true))
 	FString Prompt;
 
+	// The whole clip however many beats the prompt describes. A provider that splits the prompt shares
+	// this out between the beats rather than spending it on each (KIMODO_FRAME_DOUBLING.md). Explicit
+	// beat seconds, where the provider splits, replace it.
 	/**
-	 * Seconds to generate, for the whole clip. Clamped to the provider's supported range at submit
-	 * time.
-	 *
-	 * The whole clip however many beats the prompt describes - a provider that segments a prompt
-	 * shares this out between them rather than spending it on each. That is worth stating because
-	 * the other reading is not absurd, and a provider quietly holding it costs you a clip of the
-	 * wrong length with nothing in the log. Kimodo did exactly that until 2026-08-15; see
-	 * Plugins/MotionForgeKimodo/KIMODO_FRAME_DOUBLING.md.
-	 *
-	 * So on a segmenting provider, more beats means less time each. Budget it: three beats worth
-	 * four seconds apiece is a Length of twelve, not four.
+	 * Seconds for the whole clip. Each provider has its own range, and the Generate card says when this
+	 * is clamped. On a provider that splits prompts, the beats share it unless beat seconds are set.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "1 Prompt", meta = (ClampMin = 1, ClampMax = 60, Units = "Seconds"))
 	int32 Length = 5;
 
+	// One by default, deliberately: on pay-as-you-go every take bills when it is submitted.
 	/**
-	 * How many takes to generate.
-	 *
-	 * **One by default, and deliberately so.** On a pay-as-you-go provider every variant is billed the
-	 * moment it is submitted, kept or discarded - so a default of four charges four times for a
-	 * definition somebody made to try a single idea. That bill has already been paid once here.
-	 *
-	 * Raise it freely where generation is unmetered: a local runner costs nothing, more takes is
-	 * strictly better, and the cost line in the editor says which case you are in before you spend.
+	 * How many takes one Generate makes. Free on a local runner, where more is better; billed per take
+	 * on a paid provider, where the cost line says the price before you press Generate.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion", meta = (ClampMin = 1, ClampMax = 16))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "3 Generate", meta = (ClampMin = 1, ClampMax = 16))
 	int32 Variants = 1;
 
 	/**
-	 * Let the provider rewrite the prompt before generating.
-	 *
-	 * Some models depend on it; others flatten deliberate phrasing such as tempo adverbs. Worth
-	 * testing both ways rather than assuming.
+	 * Seconds of the imported clip to keep, as start and end. Zero keeps the whole clip. Useful where
+	 * a model pads a short action out to its minimum length.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion")
-	bool bRewritePrompt = true;
-
-	/**
-	 * Seconds to keep, as [start, end]. Leave at zero to keep the whole clip.
-	 *
-	 * Applied during normalisation. Most clips need topping and tailing because the model pads a
-	 * short action out to its minimum duration.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "4 Import")
 	FVector2D TrimWindow = FVector2D::ZeroVector;
 
-	/** Who to generate for. Falls back to the settings default when unset. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion")
+	/** Who the motion is for. Each provider needs a character prepared for it; the Character card lists the ones that suit. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "2 Character")
 	TSoftObjectPtr<UMotionCharacter> Character;
 
+	// Per clip rather than per character: it is a property of the motion, and changing it needs nothing
+	// rebuilt. It must retarget between the same two rigs as the character's.
 	/**
-	 * Retarget this clip with a different IK Retargeter than the character's usual one.
-	 *
-	 * Empty means use the character's. Set it when one clip needs retargeting differently from the
-	 * rest of the library - most often when a hand has to meet a specific object and wants IK goals
-	 * on the hands, which are wrong as a default because they turn a natural reach on a longer arm
-	 * into a lockout on a shorter one.
-	 *
-	 * The override must retarget between the same two rigs as the character's, or the clip will not
-	 * match anything else in the library. Choosing per clip rather than per character is deliberate:
-	 * it is a property of the motion, it lives with the asset that describes that motion, and it
-	 * does not require rebuilding anything to change.
+	 * A different IK Retargeter for this one clip, instead of the character's. Most often for a hand
+	 * that must meet an object and wants IK goals on the hands. Empty uses the character's.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Advanced")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "4 Import", AdvancedDisplay)
 	TSoftObjectPtr<UIKRetargeter> RetargeterOverride;
 
-	/** Which provider to use. Falls back to the settings default when unset. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Advanced",
+	/**
+	 * Which provider generates this motion. None follows the project default, and the window says
+	 * which one that is. Switching keeps each provider's own settings and picks a character that
+	 * suits the new provider.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "3 Generate",
 		meta = (GetOptions = "/Script/MotionForge.MotionForgeSettings.GetProviderOptions"))
 	FName ProviderId;
 
-	/** Provider model identifier. Falls back to the provider's default when empty. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Advanced")
-	FString ModelId;
+	// Everything below is authored content that is not a provider setting: poses pinned at moments, the
+	// timeline the prompt may live on, and per-beat seconds. The sampler fields inside FMotionControl
+	// (seed, steps, guidance, post-process, splitting) are no longer read from here - they live in
+	// the provider's pipeline, and PostLoad moves any older values across.
+	/**
+	 * Constraint poses, the prompt timeline, and seconds per beat. Edit these on the prompt timeline or
+	 * in the Kimodo Direct card; the provider's own settings live in its pipeline.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "5 Direct", AdvancedDisplay)
+	FMotionControl Control;
 
 	/**
-	 * Seed, sampler settings and kinematic constraints.
+	 * Each provider's own settings, one instance per provider this definition has used.
 	 *
-	 * On a provider that seeds, filling this in is what turns a definition into a complete recipe -
-	 * the clip becomes reproducible from the asset alone and the raw file stops being precious.
-	 * Providers that cannot honour a field ignore it and say so in the log.
-	 *
-	 * Variants walk the seed rather than repeating it, so a fixed seed with four variants gives four
-	 * different but reproducible takes.
+	 * Kept rather than replaced on a switch, so Kimodo's seed and steps are still there after a round
+	 * trip through Uthana. Edited in the Generate card; agents use Set Motion Pipeline Option.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Motion|Advanced")
-	FMotionControl Control;
+	UPROPERTY(Instanced, BlueprintReadOnly, Category = "3 Generate")
+	TArray<TObjectPtr<UMotionPipeline>> Pipelines;
+
+	/**
+	 * The character last used with each provider, so switching back picks it again.
+	 */
+	UPROPERTY()
+	TMap<FName, TSoftObjectPtr<UMotionCharacter>> CharacterByProvider;
+
+	/** The number the next take gets. Takes are numbered across every generation, never restarting. */
+	UPROPERTY()
+	int32 NextTakeNumber = 1;
+
+	// Kept so definitions saved before providers declared their own settings still load. Read once by
+	// MigrateLegacySettings and never written back - the _DEPRECATED suffix loads the old name and
+	// saves nothing. Remove once every definition has been resaved.
+	UPROPERTY()
+	FString ModelId_DEPRECATED;
+
+	UPROPERTY()
+	bool bRewritePrompt_DEPRECATED = true;
 
 	// ---------------------------------------------------------------------------------------------
 	// State - written by the pipeline, read by everyone
@@ -162,6 +160,15 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Result")
 	TSoftObjectPtr<UAnimSequence> ImportedSequence;
 
+	/**
+	 * The take the imported animation was made from.
+	 *
+	 * Not the same fact as Selected Motion Id, and not derivable from the status: generating more
+	 * takes, or choosing one whose import then fails, leaves the clip in the game exactly as it was.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Result")
+	FString ImportedMotionId;
+
 	// ---------------------------------------------------------------------------------------------
 	// Queries
 	// ---------------------------------------------------------------------------------------------
@@ -185,19 +192,83 @@ public:
 	UFUNCTION(BlueprintPure, Category = "State")
 	int32 EstimateDownloadSeconds(bool bSelectedOnly) const;
 
-	/** Apply an authoring spec, leaving pipeline state untouched. */
-	void ApplySpec(const FMotionDefSpec& Spec);
+	/**
+	 * Apply an authoring spec, leaving pipeline state untouched. Only the fields the spec fills in are
+	 * changed, so an update can set one thing without restating the rest.
+	 *
+	 * @param OutProblems Settings that were refused - an unknown option, a model the provider does not
+	 *        offer. Everything else in the spec is still applied.
+	 */
+	void ApplySpec(const FMotionDefSpec& Spec, TArray<FString>* OutProblems = nullptr);
 
 	/**
-	 * Fill in the project's defaults for whatever is still unset - character, provider, and the model
-	 * id where it belongs to that provider. Never overwrites a field that has been chosen.
+	 * Fill in the project's defaults for whatever is still unset - the provider, and a character when
+	 * the default one suits that provider. Never overwrites a field that has been chosen.
 	 *
 	 * Called on every newly created definition, whether an agent made it through CreateMotionDef or a
-	 * person made one in the Content Browser, so both arrive configured the same way. A definition
-	 * created by hand that skipped this looked identical and generated against nothing.
+	 * person made one in the Content Browser, so both arrive configured the same way.
 	 */
 	void ApplyProjectDefaults();
 
 	/** Move to a new status, recording an error when moving to Failed. */
 	void SetStatus(EMotionDefStatus NewStatus, const FString& Error = FString());
+
+	// ---------------------------------------------------------------------------------------------
+	// Pipelines
+	// ---------------------------------------------------------------------------------------------
+
+	/** The provider this definition generates on: its own, or the project default. */
+	FName GetResolvedProviderId() const;
+
+	/** This definition's settings for a provider, or null when it has never used that provider. */
+	UMotionPipeline* FindPipeline(FName InProviderId) const;
+
+	/**
+	 * This definition's settings for a provider, created with the provider's defaults on first use.
+	 * Null when the provider declares no settings or is not installed.
+	 */
+	UMotionPipeline* GetOrCreatePipeline(FName InProviderId);
+
+	/**
+	 * The settings a request is built from: this definition's instance when it has one, the
+	 * provider's defaults when it has not. Never creates anything, so it is safe from a const read.
+	 */
+	const UMotionPipeline* GetPipelineForRead(FName InProviderId) const;
+
+	/**
+	 * Move settings saved before providers declared their own into the pipelines. Safe to call at any
+	 * time; does nothing once done, and nothing while the provider plugins are not yet loaded.
+	 *
+	 * @return true when anything moved, meaning the asset should be saved.
+	 */
+	bool MigrateLegacySettings();
+
+	/** The seconds a provider-agnostic reader should show as this clip's length: the beats' sum where they set it. */
+	float GetAuthoredLengthSeconds() const;
+
+	/** Settings moved into pipelines when this was loaded, and not saved since. Migrate Definitions saves it. */
+	bool bMigratedOnLoad = false;
+
+	// ---------------------------------------------------------------------------------------------
+	// UObject
+	// ---------------------------------------------------------------------------------------------
+
+	virtual void PostLoad() override;
+	virtual void GetAssetRegistryTags(FAssetRegistryTagsContext Context) const override;
+
+#if WITH_EDITOR
+	virtual void PreEditChange(FProperty* PropertyAboutToChange) override;
+	virtual void PostEditChangeProperty(FPropertyChangedEvent& Event) override;
+
+	/** The provider as it was before an edit, so the character it used can be remembered for it. */
+	FName ProviderBeforeEdit;
+#endif
+
+	/** Asset registry tag names, read by the library so listing definitions loads none of them. */
+	static const FName TagStatus;
+	static const FName TagProvider;
+	static const FName TagTakeCount;
+	static const FName TagClip;
+	static const FName TagPrompt;
+	static const FName TagCharacter;
 };

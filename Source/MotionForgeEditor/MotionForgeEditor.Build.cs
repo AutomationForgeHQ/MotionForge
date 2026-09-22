@@ -35,6 +35,9 @@ public class MotionForgeEditor : ModuleRules
 				"ToolMenus",       // Generate lives on Sequencer's own toolbar, which is a UToolMenu
 				"UnrealEd",
 				"WorkspaceMenuStructure", // the tab category the definition window's tabs sit in
+				"AdvancedPreviewScene",   // the stage takes are judged on: environment, floor, lighting
+				"ContentBrowser",         // the mesh picker behind New character from a mesh
+				"Settings",               // opening a provider's settings page from a setup step
 			}
 			);
 	}

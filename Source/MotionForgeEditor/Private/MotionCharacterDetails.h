@@ -7,7 +7,9 @@
 #include "MotionForgeTypes.h"
 
 class IDetailCategoryBuilder;
+class IStructureDetailsView;
 class UMotionCharacter;
+struct FMotionCharacterSetupAction;
 
 /**
  * The pairing, as a sequence rather than as ten fields.
@@ -44,8 +46,15 @@ private:
 		const FLinearColor& Colour,
 		TSharedPtr<SWidget> Action = nullptr);
 
-	FReply OnUpload();
-	FReply OnImportProviderMesh();
+	/**
+	 * One section per provider this character could go to: whether it suits, the route its clips
+	 * take, the core's own fix when there is one, and the provider's actions - build a rig, upload,
+	 * fetch the provider's copy back - each with its options.
+	 */
+	void AddProviderSections(IDetailLayoutBuilder& DetailBuilder, UMotionCharacter* Char, bool bUniversal);
+
+	void AddAction(IDetailCategoryBuilder& Section, const FMotionCharacterSetupAction& Action);
+	void RunAction(const FMotionCharacterSetupAction& Action);
 
 	bool IsBusy() const { return bBusy; }
 
@@ -58,4 +67,7 @@ private:
 	IDetailLayoutBuilder* Layout = nullptr;
 
 	bool bBusy = false;
+
+	/** Kept alive with the layout: a details row holds only the widget, not the view that owns it. */
+	TArray<TSharedRef<IStructureDetailsView>> OptionForms;
 };

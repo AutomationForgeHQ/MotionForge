@@ -12,6 +12,7 @@
 
 class UMotionDef;
 class UMotionCharacter;
+class UMotionPipeline;
 class UAnimSequence;
 
 /** One in-flight job, so a poll response can be matched back to the definition that wants it. */
@@ -28,6 +29,10 @@ struct FMotionJobTracking
 
 	/** Set once the job reaches a terminal state, so it stops being polled. */
 	bool    bSettled = false;
+
+	/** Past the timeout. Still polled, less often, because the provider may yet finish - and bill. */
+	bool    bLate = false;
+	double  LastPolledAt = 0.0;
 };
 
 /** A group of definitions moving through the pipeline together. */
@@ -39,6 +44,16 @@ struct FMotionBatch
 	TArray<FMotionJobTracking> Jobs;
 	double StartedAt = 0.0;
 	bool bCancelled = false;
+
+	/**
+	 * Submissions sent and not yet answered, per definition. A definition is not finished while any of
+	 * its takes is still being submitted - a fast failure on the first must not settle it before the
+	 * second has a job id.
+	 */
+	TMap<FString, int32> PendingSubmits;
+
+	/** Providers being started before anything can be submitted. The batch is not empty while they run. */
+	int32 PendingPrepares = 0;
 };
 
 /**
@@ -81,6 +96,12 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "MotionForge|Authoring")
 	FString CreateMotionDef(const FMotionDefSpec& Spec);
+
+	/** The same, saying which of the spec's settings were refused - an unknown option, a model the provider lacks. */
+	FString CreateMotionDefChecked(const FMotionDefSpec& Spec, TArray<FString>& OutProblems);
+
+	/** Update Motion Def, saying which of the spec's settings were refused. */
+	bool UpdateMotionDefChecked(const FString& AssetPath, const FMotionDefSpec& Spec, TArray<FString>& OutProblems);
 
 	/** Overwrite a definition's authoring fields. Pipeline state and candidates are left alone. */
 	UFUNCTION(BlueprintCallable, Category = "MotionForge|Authoring")
@@ -264,15 +285,21 @@ public:
 	// ---------------------------------------------------------------------------------------------
 
 	/**
-	 * Submit generation jobs. Stops at AwaitingReview.
+	 * Submit generation jobs. Always stops at Awaiting Review, so a person or an agent chooses.
 	 *
-	 * Definitions already generating are skipped rather than resubmitted.
+	 * Definitions already generating are skipped rather than resubmitted. A provider that can start
+	 * itself - a stopped local runner - is started first rather than refused.
 	 * @return batch id, or empty when nothing was eligible.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "MotionForge|Pipeline")
 	FString Generate(const TArray<FString>& AssetPaths);
 
-	/** Generate, auto-pick the first usable take, download, normalise and import without stopping. */
+	/**
+	 * Generate, take the first usable take, download and import it without stopping.
+	 *
+	 * For pipelines and agents that were asked for an unattended run. No human button calls it: it
+	 * spends without anybody looking.
+	 */
 	UFUNCTION(BlueprintCallable, Category = "MotionForge|Pipeline")
 	FString RunFullPipeline(const TArray<FString>& AssetPaths);
 
@@ -280,18 +307,171 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "MotionForge|Pipeline")
 	FString DownloadSelected(const TArray<FString>& AssetPaths);
 
+	/**
+	 * Choose a take and import it in one step - the one verb every surface uses for it.
+	 *
+	 * Replaces the definition's clip. Ask first when Get Clip Users names anything.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Pipeline")
+	bool ChooseAndImport(const FString& AssetPath, const FString& MotionId);
+
 	/** Choose which take a definition should use. */
 	UFUNCTION(BlueprintCallable, Category = "MotionForge|Pipeline")
 	bool SelectCandidate(const FString& AssetPath, const FString& MotionId);
 
 	/**
-	 * Stop polling a batch.
+	 * Stop waiting on a batch, and put every definition in it back where it can generate again.
 	 *
-	 * Jobs already submitted keep running on the provider and their motion ids are still recorded, so
-	 * nothing paid for is thrown away - only the waiting stops.
+	 * A definition with a finished take goes to Awaiting Review; one with none goes to Failed with the
+	 * reason. Jobs already submitted may still finish on the provider - and on a paid one, still bill -
+	 * but nothing here waits for them.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "MotionForge|Pipeline")
 	bool CancelBatch(const FString& BatchId);
+
+	/** Cancel whatever one definition is waiting on, in whichever batch it is. Same settling as Cancel Batch. */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Pipeline")
+	bool CancelDefinition(const FString& AssetPath);
+
+	/** Hide a take from the list, or bring it back. Takes are never deleted: some cannot be made again. */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Pipeline")
+	bool HideTake(const FString& AssetPath, const FString& MotionId, bool bHidden);
+
+	/**
+	 * What is running now, one row per definition, for a job strip. Includes a runner being started
+	 * and a clip being imported, not only generation.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Status")
+	TArray<FMotionActivity> GetActivities() const;
+
+	// ---------------------------------------------------------------------------------------------
+	// The request, resolved once for everyone
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * Exactly what Generate would send for a definition, what it would cost, and what would stop it.
+	 *
+	 * The one resolver: readiness, the cost line, the "will be sent" block, the confirmation and the
+	 * submission all read this, so the price shown is the price of the request that is sent.
+	 * Costs nothing and sends nothing.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Status")
+	FMotionResolvedRequest ResolveRequest(const FString& AssetPath) const;
+
+	// ---------------------------------------------------------------------------------------------
+	// Providers on a definition
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * Move a definition to another provider, safely.
+	 *
+	 * Keeps each provider's own settings, so switching back gives them back. Keeps the character when
+	 * it suits the new provider; otherwise picks the one this definition last used with it, or one
+	 * prepared for it, and says which. Prompt, length and takes are left alone.
+	 *
+	 * @return One sentence saying what changed, for the window to show.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Authoring")
+	FString SetDefinitionProvider(const FString& AssetPath, FName ProviderId);
+
+	/** Called by a definition whose provider was edited in a details panel. Same rules as Set Definition Provider. */
+	FString OnDefinitionProviderChanged(UMotionDef* Def);
+
+	/**
+	 * Motion Characters that suit a provider: prepared for it, or universal and passing its checks.
+	 * Prepared ones first.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Authoring")
+	TArray<FString> FindCharactersFor(FName ProviderId) const;
+
+	/**
+	 * Whether a character suits a provider, and why not when it does not.
+	 *
+	 * A character naming another provider does not suit, whatever its fields say - its rig, its
+	 * uploaded id and its retargeter belong to that provider.
+	 */
+	bool DoesCharacterSuit(const UMotionCharacter* Character, FName ProviderId, FString* OutReason = nullptr, EMotionBlocker* OutBlocker = nullptr) const;
+
+	/** The character a definition should use with a provider: remembered, current, from its takes, or prepared for it. */
+	FString PickCharacterFor(const UMotionDef* Def, FName ProviderId) const;
+
+	/**
+	 * Make a character import clips straight onto its own skeleton: forget its provider rig and
+	 * retargeter. The fix for a provider rig imported without a retargeter. The rig assets stay.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Authoring")
+	bool ClearCharacterProviderRig(const FString& CharacterPath, FString& OutMessage);
+
+	/**
+	 * Make a Motion Character from a skeletal mesh: its skeleton becomes the target, the mesh the preview.
+	 *
+	 * The quickest route from nothing to a character a provider can generate for. Universal until a
+	 * provider needs it prepared - uploading it to one makes it that provider's. A character of that
+	 * name that already exists is returned rather than duplicated.
+	 *
+	 * @return Content path of the character, or empty with OutError set.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Authoring")
+	FString CreateCharacterFromMesh(const FString& SkeletalMeshPath, FString& OutError);
+
+	/** A definition's settings for a provider, as the flat option list. None means the definition's own provider. */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Authoring")
+	TArray<FMotionPipelineOption> GetPipelineOptions(const FString& AssetPath, FName ProviderId) const;
+
+	/** Set one of a definition's provider settings by the key Get Pipeline Options reports. */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Authoring")
+	bool SetPipelineOption(const FString& AssetPath, const FString& Key, const FString& Value, FString& OutError);
+
+	/**
+	 * Save every definition still carrying settings from before providers declared their own, in the
+	 * new form. Loading migrates in memory; this makes it permanent.
+	 *
+	 * @return How many definitions were resaved.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Authoring")
+	int32 MigrateDefinitions();
+
+	// ---------------------------------------------------------------------------------------------
+	// Watching a take before choosing it
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * Whether a take can be watched in the editor without spending anything, and why not.
+	 *
+	 * True for a take already imported, a take already on disk, and a take whose provider fetches for
+	 * free. False where fetching bills - then the provider's own viewer is the free way to look.
+	 */
+	bool CanPreviewTake(const FString& AssetPath, const FString& MotionId, FString& OutWhyNot) const;
+
+	/**
+	 * Build a take into a transient animation on the definition's character, fetching it first where
+	 * that is free. Nothing is saved and nothing enters the project; the clip lives only while watched.
+	 *
+	 * Completes on the game thread. Previews are cached per take, so watching again is instant.
+	 */
+	void PreviewTake(
+		const FString& AssetPath,
+		const FString& MotionId,
+		TFunction<void(UAnimSequence* /*Clip*/, const FString& /*Error*/)> OnReady);
+
+	/** The cached preview for a take, or null. */
+	UAnimSequence* FindPreview(const FString& AssetPath, const FString& MotionId) const;
+
+	/**
+	 * The take's fetched file, if it is still on disk, or empty.
+	 *
+	 * The recorded path first; failing that, the same file name in the staging directory. A definition
+	 * duplicated from another, or a project moved to another folder or machine, keeps its takes' old
+	 * absolute paths while the files themselves sit in this project's staging directory.
+	 */
+	static FString FindTakeFile(const FMotionCandidate& Take);
+
+	/**
+	 * What in the project uses a definition's clip - montages, sequences, dialogue - so replacing it can
+	 * be asked about by name.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Status")
+	TArray<FString> GetClipUsers(const FString& AssetPath) const;
 
 	// ---------------------------------------------------------------------------------------------
 	// Observation
@@ -318,10 +498,10 @@ public:
 	FMotionBatchStatus GetBatchStatus(const FString& BatchId) const;
 
 	/**
-	 * What downloading these definitions would cost, in seconds of motion.
+	 * What fetching these definitions' takes would cost, priced by the provider that made each one.
 	 *
-	 * Providers meter download seconds, generated seconds, or both. This reports the quantity; what
-	 * a second costs depends on the plan, which the plugin deliberately does not try to model.
+	 * Fetching only. Takes already on disk cost nothing and are not counted. What generating again
+	 * would cost is Resolve Request's answer, or Estimate Generation Cost's.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "MotionForge|Status")
 	FMotionCostEstimate EstimateCost(const TArray<FString>& AssetPaths, bool bSelectedOnly) const;
@@ -375,6 +555,13 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "MotionForge|Providers")
 	TArray<FName> GetProviderIds() const;
+
+	/**
+	 * Each installed provider's own setup, measured: keys, access grants, the machine it runs on.
+	 * None for every provider.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MotionForge|Providers")
+	TArray<FMotionSetupStepInfo> GetSetupSteps(FName ProviderId) const;
 
 	/**
 	 * What a provider can do - frame rate, length limits, whether it bills, whether it seeds.
@@ -441,16 +628,50 @@ private:
 	/** Load a definition by content path. */
 	UMotionDef* LoadDef(const FString& AssetPath) const;
 
-	/** Resolve provider and character for a definition, filling in settings defaults. */
-	bool ResolveDefinition(
+	/** None becomes the project default, decided in one place (FMotionForgeModule::ResolveDefaultProviderId). */
+	static FName ResolveProviderId(FName ProviderId);
+
+	/**
+	 * The resolver. Fills the agent-facing answer and, when asked, the per-take requests that are
+	 * actually submitted - so the two cannot describe different things.
+	 *
+	 * @param bForSubmit Also run the provider's PrepareRequest - the expensive step, such as reading
+	 *        poses off a timeline - and pick seeds for takes that asked for a random one.
+	 */
+	bool ResolveInternal(
 		UMotionDef* Def,
-		TSharedPtr<IMotionProvider>& OutProvider,
-		UMotionCharacter*& OutCharacter,
-		FString& OutError,
-		EMotionBlocker* OutBlocker = nullptr) const;
+		FMotionResolvedRequest& Out,
+		TArray<FMotionSubmitRequest>* OutRequests,
+		bool bForSubmit,
+		TSharedPtr<IMotionProvider>* OutProvider = nullptr,
+		UMotionCharacter** OutCharacter = nullptr) const;
+
+	/** Price a resolved request, in the provider's own billing unit. */
+	static void PriceRequest(const IMotionProvider& Provider, FMotionResolvedRequest& Resolved);
 
 	/** Shared implementation behind Generate and RunFullPipeline. */
 	FString StartGeneration(const TArray<FString>& AssetPaths, EMotionPipelineMode Mode);
+
+	/** Submit one resolved definition into a batch. The provider is ready by the time this runs. */
+	void SubmitDefinition(FMotionBatch& Batch, UMotionDef* Def);
+
+	/**
+	 * Settle a definition whose waiting stopped - cancelled, or its provider went away - so it can
+	 * generate again: to review when any take finished, to Failed with the reason when none did.
+	 */
+	void SettleDefinition(UMotionDef* Def, const FString& Reason);
+
+	// The job strip's rows. Set at every step, cleared when the definition settles.
+	void SetActivity(const FString& AssetPath, const FString& Doing, bool bCanCancel);
+	void ClearActivity(const FString& AssetPath);
+
+	/** The provider and character a take should be downloaded and imported through - the take's own. */
+	bool ResolveTakeRoute(
+		UMotionDef* Def,
+		const FMotionCandidate& Take,
+		TSharedPtr<IMotionProvider>& OutProvider,
+		UMotionCharacter*& OutCharacter,
+		FString& OutError) const;
 
 	/** Poll every in-flight job. Driven by the ticker. */
 	bool Tick(float DeltaTime);
@@ -463,8 +684,8 @@ private:
 	/** Fetch, normalise and import the selected candidate. */
 	void ProcessSelected(UMotionDef* Def);
 
-	/** Normalise and import a file already on disk. */
-	void NormalizeAndImport(UMotionDef* Def, const FString& RawPath);
+	/** Normalise and import a take's file already on disk, through the take's own provider. */
+	void NormalizeAndImport(UMotionDef* Def, const FString& MotionId, const FString& RawPath);
 
 	/** Write an asset's package to disk, if anything dirtied it. */
 	static void SaveAsset(UObject* Asset);
@@ -506,24 +727,51 @@ private:
 		FString& OutError);
 
 	/**
-	 * Fill in which of the two second-counts actually bills, and what it comes to.
-	 *
-	 * @param bAnyMetered False when nothing in the estimate uses a provider that charges, which
-	 *        zeroes the money rather than reporting a plan that does not apply.
+	 * The same retarget, frame by frame into a clip that lives only in memory - for watching a take
+	 * before it is chosen. The same retargeter and meshes the import uses, so what plays is what the
+	 * import would produce; no asset, no package, no dialog.
 	 */
-	static void ApplyBilling(FMotionCostEstimate& Estimate, bool bAnyMetered);
+	UAnimSequence* RetargetForPreview(
+		UMotionDef* Def,
+		UMotionCharacter* Character,
+		UAnimSequence* SourceSequence,
+		FString& OutError);
+
+	/**
+	 * Add one provider's share to an estimate, in that provider's own unit.
+	 *
+	 * Per provider rather than one project-wide plan, because a selection can span a local runner, a
+	 * rented pod and a paid service, and each bills - or does not - in its own way. The old single plan
+	 * priced a rented Kimodo pod at Uthana's per-second rate.
+	 */
+	static void AccumulateCost(
+		FMotionCostEstimate& Estimate,
+		const FMotionBilling& Billing,
+		const FString& ProviderName,
+		int32 Takes,
+		float GeneratedSeconds,
+		float DownloadSeconds);
+
+	/** Write the summary sentence once every provider's share is in. */
+	static void FinishCost(FMotionCostEstimate& Estimate, const TArray<FString>& Lines);
 
 	/** Batch ids are readable rather than GUIDs, because a human reads them in logs. */
 	static FString MakeBatchId();
 
-	/**
-	 * The rate a provider generates at, which is the only rate a clip should be handled at.
-	 *
-	 * Falls back to the settings value only when there is no provider to ask.
-	 */
+	/** The rate a provider generates at, which is the only rate a clip should be handled at. */
 	static int32 ResolveFrameRate(const TSharedPtr<IMotionProvider>& Provider);
 
 	TMap<FString, FMotionBatch> Batches;
+
+	/** One row per definition with work in flight. */
+	TMap<FString, FMotionActivity> Activities;
+
+	/** Transient previews of takes, by definition path and motion id. Kept alive here, never saved. */
+	UPROPERTY(Transient)
+	TMap<FString, TObjectPtr<UAnimSequence>> Previews;
+
+	/** Previews being fetched, so a second request waits for the first instead of fetching twice. */
+	TMap<FString, TArray<TFunction<void(UAnimSequence*, const FString&)>>> PreviewWaiters;
 
 	/** The stranded-definition sweep runs once, on the first tick. See Tick for why not in Initialize. */
 	bool bSweptStrandedDefinitions = false;

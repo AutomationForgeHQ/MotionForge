@@ -7,28 +7,29 @@
 
 class FWorkspaceItem;
 class IDetailsView;
-class SMotionDefTakes;
+class SMotionGeneratePanel;
+class SMotionTakesPanel;
 class UMotionDef;
 
 /**
  * The window a Motion Definition opens into.
  *
- * A definition is sixteen properties across three groups, of which a person authoring one cares
- * about five - and the details panel it used to open in gave equal weight to all of them, put the
- * takes in a collapsed array, and buried the error string in a list. This exists so that the two
- * questions somebody actually has - *what did I ask for* and *which take do I keep* - are the two
- * halves of one window.
+ * The work on the left and the controls on the right, MeshForge's arrangement. Left: the stage with
+ * the takes under it, and each take's full record. Right: the cards that say what to make, for whom,
+ * on which provider and at what cost - and the full settings for somebody who wants every field.
  *
- * It owns no pipeline logic. Every command here calls UMotionForgeSubsystem, so nothing is reachable
- * from this window that an agent cannot reach from a tool call.
+ * It owns no pipeline logic. Every button calls UMotionForgeSubsystem, so nothing is reachable from
+ * this window that an agent cannot reach from a tool call.
  */
 class MOTIONFORGEEDITOR_API FMotionDefEditorToolkit : public FAssetEditorToolkit
 {
 public:
 
 	static const FName ToolkitName;
-	static const FName DetailsTabId;
 	static const FName TakesTabId;
+	static const FName RecordTabId;
+	static const FName GenerateTabId;
+	static const FName SettingsTabId;
 
 	void Initialise(EToolkitMode::Type Mode, const TSharedPtr<IToolkitHost>& Host, UMotionDef* Def);
 
@@ -44,35 +45,26 @@ public:
 
 private:
 
-	TSharedRef<SDockTab> SpawnDetailsTab(const FSpawnTabArgs& Args);
 	TSharedRef<SDockTab> SpawnTakesTab(const FSpawnTabArgs& Args);
+	TSharedRef<SDockTab> SpawnRecordTab(const FSpawnTabArgs& Args);
+	TSharedRef<SDockTab> SpawnGenerateTab(const FSpawnTabArgs& Args);
+	TSharedRef<SDockTab> SpawnSettingsTab(const FSpawnTabArgs& Args);
 
 	void ExtendToolbar();
 	void FillToolbar(class FToolBarBuilder& Builder);
 
-	// The four verbs. Each is one subsystem call and a refresh; none of them decides anything.
-	void OnGenerate();
-	bool CanGenerate() const;
-
-	void OnImportChosen();
-	bool CanImportChosen() const;
-
+	// Navigation only; the verbs live in the cards, beside what they act on.
 	void OnOpenPromptSequence();
-
 	void OnShowAnimation();
 	bool CanShowAnimation() const;
-
-	/** Says why Generate is greyed out, when it is - a disabled button owes an explanation. */
-	FText GenerateTooltip() const;
-
-	/** The import button's label changes with the billing model, because the decision does. */
-	FText ImportLabel() const;
-	FText ImportTooltip() const;
+	FText ShowAnimationTooltip() const;
+	void OnOpenLibrary();
 
 	UMotionDef* Def() const { return Definition.Get(); }
 
 	TWeakObjectPtr<UMotionDef> Definition;
 	TSharedPtr<IDetailsView> DetailsView;
-	TSharedPtr<SMotionDefTakes> TakesPanel;
+	TSharedPtr<SMotionTakesPanel> TakesPanel;
+	TSharedPtr<SMotionGeneratePanel> GeneratePanel;
 	TSharedPtr<FWorkspaceItem> WorkspaceMenuCategory;
 };

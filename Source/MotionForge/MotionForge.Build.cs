@@ -72,6 +72,7 @@ public class MotionForge : ModuleRules
 				"Slate",
 				"SlateCore",
 				"IKRigEditor",   // UIKRetargetBatchOperation, for retargeting onto the game's rig
+				"AnimationBlueprintLibrary",   // evaluating a clip's pose frame by frame, for the in-memory preview retarget
 				"MovieSceneTools", // Sequencer's own bake, the only thing that resolves a Control Rig
 				"ControlRig",      // the rig a constraint pose is authored on
 				"ControlRigEditor",// FindOrCreateControlRigTrack - adding one to a sequence is editor work

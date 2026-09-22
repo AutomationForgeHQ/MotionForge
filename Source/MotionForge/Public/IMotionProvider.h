@@ -5,9 +5,13 @@
 #include "CoreMinimal.h"
 #include "MotionForgeTypes.h"
 #include "MotionControl.h"
+#include "UObject/StructOnScope.h"
 
 class USkeleton;
 class UAnimSequence;
+class UMotionCharacter;
+class UMotionDef;
+class UMotionPipeline;
 
 /** One generation request. */
 struct FMotionSubmitRequest
@@ -15,11 +19,21 @@ struct FMotionSubmitRequest
 	FString Prompt;
 	FString ModelId;
 	FString ProviderCharacterId;
+
+	/**
+	 * Seconds for the whole clip. Whole seconds on providers that take an integer; Kimodo takes the
+	 * float in LengthSeconds.
+	 */
 	int32   Length = 5;
+	float   LengthSeconds = 5.f;
+
 	bool    bRewritePrompt = true;
 
 	/** Which of the requested takes this is. Carried through so results can be matched back. */
 	int32   VariantIndex = 0;
+
+	/** The definition this request is for, when there is one. Providers may read it; they must not write it. */
+	const UMotionDef* Definition = nullptr;
 
 	/**
 	 * The skeleton the result will land on. May be null.
@@ -131,6 +145,13 @@ struct FMotionArtifactImport
 
 	/** Which second of that clip to read. Its own frame zero unless somebody picked a better one. */
 	float UntrackedPoseTime = 0.f;
+
+	/**
+	 * Build a preview that is never saved: a transient package under /Temp, no asset registry entry,
+	 * nothing on disk. For watching a take before choosing it, so ten looks do not leave ten clips in
+	 * the project.
+	 */
+	bool bTransient = false;
 };
 
 struct FMotionArtifactResult
@@ -138,6 +159,75 @@ struct FMotionArtifactResult
 	bool bSuccess = false;
 	TSoftObjectPtr<UAnimSequence> Sequence;
 	FString Error;
+};
+
+/**
+ * One thing a provider needs done to a character before it can generate for it - upload it, build a
+ * rig - offered as a button on the character without the core knowing what the step is.
+ */
+struct FMotionCharacterSetupAction
+{
+	/** The button: "Upload to Uthana", "Build Kimodo rig". */
+	FText Label;
+
+	/** What pressing it does, what it costs, how long it takes. */
+	FText Tooltip;
+
+	/** Already done for this character. The button then reads as a redo, not a step. */
+	bool bDone = false;
+
+	/** A step without which the provider cannot generate for this character. */
+	bool bRequired = false;
+
+	/** Done state in words: "Uploaded as 'Quinn' (id c0f2...)". */
+	FText Status;
+
+	/** Asks before running, with this sentence: a second upload creates a second character on the provider. */
+	FText Confirmation;
+
+	/**
+	 * Settings the person may change before running it, drawn as a small form beside the button - the
+	 * provider's own upload options, say. Run reads the same memory. Null when there is nothing to set.
+	 */
+	TSharedPtr<FStructOnScope> Options;
+
+	/** Runs the step. Completes on the game thread with a sentence for the character window. */
+	TFunction<void(TFunction<void(bool /*bSuccess*/, const FString& /*Message*/)>)> Run;
+};
+
+/** How far a provider's own setup has got, one step per row on the Get Started page. */
+enum class EMotionSetupState : uint8
+{
+	Done,
+	Todo,
+	/** Waiting on something slow - a download, a review - that needs no action now. */
+	Waiting,
+	/** Cannot be started until an earlier step is done. */
+	Blocked,
+	/** Not measured yet. Never drawn as done or as broken. */
+	Unknown
+};
+
+/** One setup step, stated by the provider and drawn by the core. */
+struct FMotionSetupStep
+{
+	FText Label;
+
+	/** What the state means, measured: "Docker Desktop 4.41 is running", "No token stored". */
+	FText Detail;
+
+	EMotionSetupState State = EMotionSetupState::Unknown;
+
+	/** The button that moves this step on, when one exists. */
+	FText ActionLabel;
+	TFunction<void()> Action;
+
+	/** A page to read or visit, when the step happens outside the editor: a licence to accept. */
+	FString HelpUrl;
+	FText HelpLabel;
+
+	/** Optional steps are drawn quietly and never block the provider. */
+	bool bOptional = false;
 };
 
 using FOnMotionSubmitComplete   = TFunction<void(const FMotionSubmitResult&)>;
@@ -272,6 +362,91 @@ public:
 
 	/** Model used when a definition names none. */
 	virtual FString GetDefaultModelId() const = 0;
+
+	// ---------------------------------------------------------------------------------------------
+	// What this provider offers, declared so nothing above has to know it by name.
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * The settings class a definition keeps for this provider, a UMotionPipeline subclass.
+	 *
+	 * Null for a provider with nothing to set beyond the prompt, length and takes every provider shares.
+	 */
+	virtual UClass* GetPipelineClass() const { return nullptr; }
+
+	/** The models it offers. The default is the one model GetDefaultModelId names, with GetLengthRange's lengths. */
+	virtual TArray<FMotionModelInfo> GetModels() const;
+
+	/** Whether it cuts a prompt into beats, and the per-beat and whole-clip limits. Default: it does not. */
+	virtual FMotionPromptSplitting GetPromptSplitting() const;
+
+	/**
+	 * How it bills, right now. The default follows the caps: free when not metered, and "billed, rate
+	 * unknown" when metered - a provider that bills should say how.
+	 */
+	virtual FMotionBilling GetBilling() const;
+
+	/** One line on what this provider is, for someone choosing: "Hosted, paid per generated second". */
+	virtual FText GetTagline() const { return FText(); }
+
+	/**
+	 * Get ready for a generation that is about to be submitted - start a stopped runner, wake a pod.
+	 *
+	 * Called when readiness reports Provider Startable, before submitting, so Generate starts what it
+	 * needs rather than refusing. Completes on the game thread; false with a sentence when it could not.
+	 */
+	virtual void PrepareForWork(TFunction<void(bool /*bReady*/, const FString& /*Message*/)> OnDone)
+	{
+		OnDone(true, FString());
+	}
+
+	/** What Prepare For Work is doing right now, with how long it has taken. Empty when it is not running. */
+	virtual FString GetPreparationProgress() const { return FString(); }
+
+	/**
+	 * Turn the definition-level request into what this provider will send, once per definition and
+	 * before it is copied per take. The place for anything expensive - reading poses off a timeline -
+	 * so four takes do not pay for it four times. Warnings go to the job strip and the log.
+	 */
+	virtual void PrepareRequest(FMotionSubmitRequest& Request, TArray<FString>& OutWarnings) const {}
+
+	/**
+	 * Whether a character can be generated for by this provider, and what is missing when it cannot.
+	 *
+	 * The provider-specific half: an uploaded id where the provider generates against uploaded
+	 * characters, a retargeter where a rig is set. The provider-agnostic half - a target skeleton - is
+	 * checked by the core first.
+	 *
+	 * @param OutBlocker Which kind of problem, so the window offers the right action.
+	 */
+	virtual bool CheckCharacter(const UMotionCharacter* Character, FString& OutReason, EMotionBlocker& OutBlocker) const;
+
+	/** Where clips land for this character, in words: "direct onto SK_Mannequin", "retargeted from Kimodo's rig". */
+	virtual FString DescribeCharacterRoute(const UMotionCharacter* Character) const;
+
+	/** The buttons this provider offers on a Motion Character: upload it, build a rig for it. */
+	virtual void GetCharacterSetupActions(UMotionCharacter* Character, TArray<FMotionCharacterSetupAction>& OutActions) {}
+
+	/**
+	 * Ways this provider can be directed beyond the prompt, offered on a definition - pin a pose, show
+	 * the constraints that will be sent. Drawn in the definition window's Direct card, which appears
+	 * only for providers that return something. Same shape as a character action: a label, an optional
+	 * options form, and a Run that answers with a sentence.
+	 */
+	virtual void GetDirectActions(UMotionDef* Definition, TArray<FMotionCharacterSetupAction>& OutActions) {}
+
+	/**
+	 * A short guide to directing this provider, in plain prose for the Direct card: what each lever
+	 * does and when to reach for it. Empty for a provider that is directed by its prompt alone.
+	 */
+	virtual FText GetDirectingGuide() const { return FText(); }
+
+	/**
+	 * This provider's own setup, as steps for someone who has just installed it: keys, access grants,
+	 * the machine it runs on. Drawn on the Get Started page. Measured, never assumed - a step whose
+	 * state was not checked says Unknown.
+	 */
+	virtual void GetSetupSteps(TArray<FMotionSetupStep>& OutSteps) const {}
 
 	/**
 	 * Clip length limits for a model, in seconds.

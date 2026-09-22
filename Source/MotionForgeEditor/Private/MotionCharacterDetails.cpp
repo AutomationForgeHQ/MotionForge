@@ -2,6 +2,7 @@
 
 #include "MotionCharacterDetails.h"
 
+#include "IMotionProvider.h"
 #include "MotionCharacter.h"
 #include "MotionForgeSettings.h"
 #include "MotionForgeSubsystem.h"
@@ -11,10 +12,14 @@
 #include "DetailWidgetRow.h"
 #include "PropertyHandle.h"
 #include "Framework/Notifications/NotificationManager.h"
+#include "IStructureDetailsView.h"
+#include "Misc/MessageDialog.h"
+#include "PropertyEditorModule.h"
 #include "Styling/AppStyle.h"
 #include "Widgets/Images/SImage.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Layout/SBox.h"
+#include "Widgets/Layout/SExpandableArea.h"
 #include "Widgets/Notifications/SNotificationList.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
@@ -66,6 +71,7 @@ void FMotionCharacterDetails::Rebuild()
 void FMotionCharacterDetails::CustomizeDetails(IDetailLayoutBuilder& DetailBuilder)
 {
 	Layout = &DetailBuilder;
+	OptionForms.Reset();
 
 	TArray<TWeakObjectPtr<UObject>> Objects;
 	DetailBuilder.GetObjectsBeingCustomized(Objects);
@@ -166,30 +172,14 @@ void FMotionCharacterDetails::CustomizeDetails(IDetailLayoutBuilder& DetailBuild
 	}
 	else if (Caps.bSupportsCharacterUpload)
 	{
+		// The fact only. The upload itself is the provider's own action, below, with its options.
 		const bool bPaired = !Char->ProviderCharacterId.IsEmpty();
-
-		TSharedPtr<SWidget> UploadButton;
-		if (!bPaired)
-		{
-			UploadButton = SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "PrimaryButton")
-				.Text(FText::Format(LOCTEXT("UploadFmt", "Upload to {0}"),
-					FText::FromString(Caps.DisplayName)))
-				.ToolTipText(LOCTEXT("UploadTip",
-					"Exports the preview mesh and sends it, then writes the id it comes back with "
-					"into this asset.\n\n"
-					"Not repeatable by accident: a character that already has an id is refused, "
-					"because repointing it would orphan every take generated against the old one."))
-				.IsEnabled_Lambda([this, bHasPreview]() { return !IsBusy() && bHasPreview; })
-				.OnClicked(this, &FMotionCharacterDetails::OnUpload);
-		}
 
 		AddStep(Category, LOCTEXT("StepPaired", "Paired"),
 			bPaired
 				? FText::FromString(Char->ProviderCharacterId)
-				: LOCTEXT("NotPaired", "not uploaded yet"),
-			bPaired ? MotionCharacterUI::GoodColour : MotionCharacterUI::WarnColour,
-			UploadButton);
+				: LOCTEXT("NotPaired", "not uploaded yet - the upload is below"),
+			bPaired ? MotionCharacterUI::GoodColour : MotionCharacterUI::WarnColour);
 	}
 
 	// 4. Which of the two pipelines this character uses.
@@ -200,21 +190,6 @@ void FMotionCharacterDetails::CustomizeDetails(IDetailLayoutBuilder& DetailBuild
 	// a working character that they had work left.
 	const bool bRetargets = !Char->ProviderMesh.IsNull();
 
-	TSharedPtr<SWidget> ImportButton;
-	if (!bRetargets && Caps.bSupportsCharacterUpload && !Char->ProviderCharacterId.IsEmpty())
-	{
-		ImportButton = SNew(SButton)
-			.Text(FText::Format(LOCTEXT("ImportRigFmt", "Import rig from {0}"),
-				FText::FromString(Caps.DisplayName)))
-			.ToolTipText(LOCTEXT("ImportRigTip",
-				"Fetches the character back as the provider actually stores it, and switches this "
-				"character to the retargeted pipeline.\n\n"
-				"Providers normalise a rig on ingest, so the file we sent is not the skeleton their "
-				"animation fits. Importing their copy removes any guessing about stripped bones."))
-			.IsEnabled_Lambda([this]() { return !IsBusy(); })
-			.OnClicked(this, &FMotionCharacterDetails::OnImportProviderMesh);
-	}
-
 	AddStep(Category, LOCTEXT("StepPipeline", "Pipeline"),
 		bRetargets
 			? FText::Format(LOCTEXT("PipelineRetargetFmt", "retargeted - clips arrive on {0}"),
@@ -223,8 +198,7 @@ void FMotionCharacterDetails::CustomizeDetails(IDetailLayoutBuilder& DetailBuild
 				Char->TargetSkeleton.IsNull()
 					? LOCTEXT("TheSkeleton", "the target skeleton")
 					: FText::FromString(Char->TargetSkeleton.GetAssetName())),
-		MotionCharacterUI::GoodColour,
-		ImportButton);
+		MotionCharacterUI::GoodColour);
 
 	// Direct is only correct where the provider hands back the bone names this skeleton already
 	// has. Where it does not, the clip imports without a warning and comes out subtly twisted -
@@ -256,11 +230,30 @@ void FMotionCharacterDetails::CustomizeDetails(IDetailLayoutBuilder& DetailBuild
 			bHasRetargeter ? MotionCharacterUI::GoodColour : MotionCharacterUI::BadColour);
 	}
 
+	// What each provider offers this character, in the provider's own terms: build a rig for it,
+	// upload it, fetch its copy back. A universal character sees every installed provider, because
+	// it could go to any of them; one prepared for a provider sees only that one.
+	AddProviderSections(DetailBuilder, Char, bUniversal);
+
 	// The verdict, in the pipeline's own words rather than this page's opinion of them.
+	//
+	// For a character prepared for a provider, the same question Generate asks - including a provider
+	// rig with nothing to move clips off it - so this line and the provider's section below cannot
+	// disagree about one character on one page.
 	FString Reason;
-	const bool bUsable = bUniversal
-		? Char->IsUsable(Reason)
-		: Char->IsUsableForProvider(Caps.bSupportsCharacterUpload, Reason);
+	bool bUsable = false;
+	if (bUniversal)
+	{
+		bUsable = Char->IsUsable(Reason);
+	}
+	else if (UMotionForgeSubsystem* Subsystem = UMotionForgeSubsystem::Get())
+	{
+		bUsable = Subsystem->DoesCharacterSuit(Char, Char->ProviderId, &Reason);
+	}
+	else
+	{
+		bUsable = Char->IsUsableForProvider(Caps.bSupportsCharacterUpload, Reason);
+	}
 
 	Category.AddCustomRow(LOCTEXT("VerdictRow", "Ready"))
 	.WholeRowContent()
@@ -324,71 +317,179 @@ void FMotionCharacterDetails::AddStep(
 
 // -------------------------------------------------------------------------------------------------
 
-FReply FMotionCharacterDetails::OnUpload()
+void FMotionCharacterDetails::AddProviderSections(IDetailLayoutBuilder& DetailBuilder, UMotionCharacter* Char, bool bUniversal)
 {
-	UMotionCharacter* Char = Character();
 	UMotionForgeSubsystem* Subsystem = UMotionForgeSubsystem::Get();
-
-	if (!Char || !Subsystem || bBusy)
+	if (!Subsystem || !Char)
 	{
-		return FReply::Handled();
+		return;
 	}
 
-	bBusy = true;
-	MotionCharacterUI::Tell(TEXT("Exporting and uploading the character. This takes a moment."), true);
+	TArray<FName> Ids;
+	if (bUniversal)
+	{
+		Ids = Subsystem->GetProviderIds();
+	}
+	else
+	{
+		Ids.Add(Char->ProviderId);
+	}
 
-	TWeakPtr<FMotionCharacterDetails> Weak = SharedThis(this);
+	const FString CharPath = Char->GetPathName();
 
-	Subsystem->UploadCharacter(Char->GetPathName(), FMotionCharacterUploadOptions(), /*bForce*/ false,
-		[Weak](bool bSuccess, const FMotionCharacterUpload& Result, const FString& Error)
+	for (const FName Id : Ids)
+	{
+		TSharedPtr<IMotionProvider> Provider = Subsystem->FindProvider(Id);
+		if (!Provider.IsValid())
 		{
-			if (TSharedPtr<FMotionCharacterDetails> Self = Weak.Pin())
-			{
-				Self->bBusy = false;
+			continue;
+		}
 
-				MotionCharacterUI::Tell(bSuccess
-					? FString::Printf(TEXT("Paired. The provider's id is %s."), *Result.ProviderCharacterId)
-					: Error, bSuccess);
+		TArray<FMotionCharacterSetupAction> Actions;
+		Provider->GetCharacterSetupActions(Char, Actions);
+		const FString Route = Provider->DescribeCharacterRoute(Char);
 
-				Self->Rebuild();
-			}
-		});
+		FString Why;
+		EMotionBlocker Blocker = EMotionBlocker::None;
+		const bool bSuits = Subsystem->DoesCharacterSuit(Char, Id, &Why, &Blocker);
 
-	return FReply::Handled();
+		IDetailCategoryBuilder& Section = DetailBuilder.EditCategory(
+			FName(*FString::Printf(TEXT("With%s"), *Id.ToString())),
+			FText::Format(LOCTEXT("WithProviderFmt", "With {0}"), FText::FromString(Provider->GetDisplayName())),
+			ECategoryPriority::Important);
+
+		// For a character prepared for this provider the verdict at the end of Pairing already says
+		// this; a universal one has no verdict per provider, so each section says its own.
+		if (bUniversal)
+		{
+			AddStep(Section, LOCTEXT("StepSuits", "Ready"),
+				bSuits
+					? FText::Format(LOCTEXT("SuitsFmt", "yes - {0} can generate for this character"), FText::FromString(Provider->GetDisplayName()))
+					: FText::FromString(Why),
+				bSuits ? MotionCharacterUI::GoodColour : MotionCharacterUI::WarnColour);
+		}
+
+		if (!Route.IsEmpty())
+		{
+			AddStep(Section, LOCTEXT("StepRoute", "Clips are"), FText::FromString(Route), MotionCharacterUI::QuietColour);
+		}
+
+		// The fix the core can make for any provider: a provider rig with no retargeter imports
+		// directly once the rig is forgotten. The same button the definition window and Get Started have.
+		if (!bSuits && Blocker == EMotionBlocker::RetargetIncomplete && !Char->ProviderMesh.IsNull() && Char->Retargeter.IsNull())
+		{
+			TWeakPtr<FMotionCharacterDetails> Weak = SharedThis(this);
+			AddStep(Section, FText::GetEmpty(),
+				LOCTEXT("DirectFixDetail", "Or import straight onto the target skeleton, which needs no retargeter."),
+				MotionCharacterUI::QuietColour,
+				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "PrimaryButton")
+				.Text(LOCTEXT("ImportDirectlyBtn", "Import directly"))
+				.IsEnabled_Lambda([this]() { return !IsBusy(); })
+				.OnClicked_Lambda([Weak, CharPath]()
+				{
+					if (UMotionForgeSubsystem* F = UMotionForgeSubsystem::Get())
+					{
+						FString Said;
+						const bool bOk = F->ClearCharacterProviderRig(CharPath, Said);
+						MotionCharacterUI::Tell(Said, bOk);
+						if (TSharedPtr<FMotionCharacterDetails> Self = Weak.Pin())
+						{
+							Self->Rebuild();
+						}
+					}
+					return FReply::Handled();
+				}));
+		}
+
+		for (const FMotionCharacterSetupAction& Action : Actions)
+		{
+			AddAction(Section, Action);
+		}
+	}
 }
 
-FReply FMotionCharacterDetails::OnImportProviderMesh()
+void FMotionCharacterDetails::AddAction(IDetailCategoryBuilder& Section, const FMotionCharacterSetupAction& Action)
 {
-	UMotionCharacter* Char = Character();
-	UMotionForgeSubsystem* Subsystem = UMotionForgeSubsystem::Get();
-
-	if (!Char || !Subsystem || bBusy)
-	{
-		return FReply::Handled();
-	}
-
-	bBusy = true;
-	MotionCharacterUI::Tell(TEXT("Fetching the character back from the provider."), true);
-
 	TWeakPtr<FMotionCharacterDetails> Weak = SharedThis(this);
+	const FMotionCharacterSetupAction Copy = Action;
+	const bool bPrimary = Action.bRequired && !Action.bDone;
 
-	Subsystem->ImportProviderCharacter(Char->GetPathName(),
-		[Weak](bool bSuccess, const FString& MeshPath, const FString& Error)
+	AddStep(Section, Action.Label,
+		Action.Status.IsEmpty() ? Action.Tooltip : Action.Status,
+		Action.bDone ? MotionCharacterUI::GoodColour : (Action.bRequired ? MotionCharacterUI::WarnColour : MotionCharacterUI::QuietColour),
+		SNew(SButton)
+		.ButtonStyle(FAppStyle::Get(), bPrimary ? "PrimaryButton" : "Button")
+		.Text(Action.Label)
+		.ToolTipText(Action.Tooltip)
+		.IsEnabled_Lambda([this]() { return !IsBusy(); })
+		.OnClicked_Lambda([Weak, Copy]()
 		{
 			if (TSharedPtr<FMotionCharacterDetails> Self = Weak.Pin())
 			{
-				Self->bBusy = false;
-
-				MotionCharacterUI::Tell(bSuccess
-					? FString::Printf(TEXT("Imported %s. Author a retargeter from it to the preview "
-										   "mesh next."), *MeshPath)
-					: Error, bSuccess);
-
-				Self->Rebuild();
+				Self->RunAction(Copy);
 			}
-		});
+			return FReply::Handled();
+		}));
 
-	return FReply::Handled();
+	// The provider's own options for the step - upload options, say - folded under it.
+	if (Action.Options.IsValid())
+	{
+		FPropertyEditorModule& PropertyModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>(TEXT("PropertyEditor"));
+
+		FDetailsViewArgs Args;
+		Args.bAllowSearch = false;
+		Args.NameAreaSettings = FDetailsViewArgs::HideNameArea;
+		Args.bHideSelectionTip = true;
+
+		FStructureDetailsViewArgs StructArgs;
+		TSharedRef<IStructureDetailsView> Form = PropertyModule.CreateStructureDetailView(Args, StructArgs, Action.Options);
+		OptionForms.Add(Form);
+
+		Section.AddCustomRow(FText::Format(LOCTEXT("OptionsRowFmt", "{0} options"), Action.Label))
+		.WholeRowContent()
+		[
+			SNew(SBox)
+			.Padding(FMargin(20.f, 0.f, 0.f, 0.f))
+			[
+				SNew(SExpandableArea)
+				.InitiallyCollapsed(true)
+				.AreaTitle(FText::Format(LOCTEXT("ActionOptionsFmt", "{0}: options"), Action.Label))
+				.BodyContent()
+				[
+					Form->GetWidget().ToSharedRef()
+				]
+			]
+		];
+	}
+}
+
+void FMotionCharacterDetails::RunAction(const FMotionCharacterSetupAction& Action)
+{
+	if (!Action.Run || bBusy)
+	{
+		return;
+	}
+
+	if (!Action.Confirmation.IsEmpty()
+		&& FMessageDialog::Open(EAppMsgType::OkCancel, Action.Confirmation, Action.Label) != EAppReturnType::Ok)
+	{
+		return;
+	}
+
+	bBusy = true;
+	MotionCharacterUI::Tell(FString::Printf(TEXT("%s..."), *Action.Label.ToString()), true);
+
+	TWeakPtr<FMotionCharacterDetails> Weak = SharedThis(this);
+	Action.Run([Weak](bool bOk, const FString& Said)
+	{
+		if (TSharedPtr<FMotionCharacterDetails> Self = Weak.Pin())
+		{
+			Self->bBusy = false;
+			MotionCharacterUI::Tell(Said, bOk);
+			Self->Rebuild();
+		}
+	});
 }
 
 #undef LOCTEXT_NAMESPACE

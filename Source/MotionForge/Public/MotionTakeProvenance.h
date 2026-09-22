@@ -140,6 +140,13 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Recipe")
 	int32 RequestedLengthSeconds = 0;
 
+	/** Which take of the definition this was, and the provider settings it was sent with. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Recipe")
+	FString TakeLabel;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Recipe")
+	FString SettingsSent;
+
 	// --- what came back --------------------------------------------------------------------------
 
 	/**
@@ -297,6 +304,15 @@ struct MOTIONFORGE_API FMotionProvenanceRow
 	UPROPERTY(BlueprintReadOnly, Category = "Provenance") FString GeneratedAt;
 };
 
+/**
+ * Declared here at global scope on purpose: `Stamp` below takes one, and an elaborated
+ * `const struct FMotionCandidate*` written inside the namespace would declare a *new* incomplete
+ * `FMotionProvenance::FMotionCandidate` rather than naming this one. That compiles wherever
+ * MotionForgeTypes.h happens to have been included first - which is most of a unity build, and
+ * none of a standalone compile of MotionTakeProvenance.cpp.
+ */
+struct FMotionCandidate;
+
 /** Writes provenance onto a finished clip. Failure is never fatal - a record is not the product. */
 namespace FMotionProvenance
 {
@@ -332,7 +348,8 @@ namespace FMotionProvenance
 		bool bRunnerWasLocal,
 		int32 NativeFrameRate,
 		bool bWasNormalized,
-		bool bWasRetargeted);
+		bool bWasRetargeted,
+		const FMotionCandidate* Take = nullptr);
 
 	/** The record on a clip, or nullptr when it has none - which itself dates the asset. */
 	MOTIONFORGE_API const UMotionTakeProvenance* Read(const UAnimSequence* Sequence);

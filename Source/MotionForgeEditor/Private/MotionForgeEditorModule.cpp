@@ -3,7 +3,7 @@
 #include "MotionCharacterDetails.h"
 #include "MotionConstraintTrackEditor.h"
 #include "MotionPromptTrackEditor.h"
-#include "SMotionLibrary.h"
+#include "SMotionHome.h"
 
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/Docking/TabManager.h"
@@ -33,7 +33,15 @@ namespace
 			 "what it produced."),
 		FConsoleCommandDelegate::CreateLambda([]()
 		{
-			FGlobalTabmanager::Get()->TryInvokeTab(FMotionForgeEditorModule::LibraryTabName);
+			SMotionHome::Open(EMotionHomePage::Library);
+		}));
+
+	FAutoConsoleCommand OpenGetStartedCommand(
+		TEXT("MotionForge.GetStarted"),
+		TEXT("Open Get Started: set up a provider and a character, and make a first motion, step by step."),
+		FConsoleCommandDelegate::CreateLambda([]()
+		{
+			SMotionHome::Open(EMotionHomePage::GetStarted);
 		}));
 }
 
@@ -75,12 +83,13 @@ void FMotionForgeEditorModule::StartupModule()
 				return SNew(SDockTab)
 					.TabRole(ETabRole::NomadTab)
 					[
-						SNew(SMotionLibrary)
+						SNew(SMotionHome)
 					];
 			}))
-		.SetDisplayName(LOCTEXT("LibraryTabTitle", "Motion Library"))
+		.SetDisplayName(LOCTEXT("LibraryTabTitle", "MotionForge"))
 		.SetTooltipText(LOCTEXT("LibraryTabTip",
-			"Every motion definition in the project, what state each is in, and what it produced."))
+			"Get started with a first motion, and every motion definition in the project with what state "
+			"each is in and what it produced."))
 		.SetIcon(FSlateIcon(FAppStyle::GetAppStyleSetName(), "ClassIcon.AnimSequence"))
 		// Hidden from the auto-populated Tools list: the family's "Automation Forge" section is the
 		// one entry.
@@ -97,16 +106,18 @@ void FMotionForgeEditorModule::RegisterLibraryMenu()
 	FToolMenuSection& Section = Tools->FindOrAddSection("AutomationForge",
 		LOCTEXT("ToolsSection", "Automation Forge"));
 
+	// One entry, landing on whichever page fits: Get Started until the project has a motion to show,
+	// the library after. The page switch is at the top of the tab.
 	Section.AddMenuEntry(
 		"MotionForgeLibrary",
-		LOCTEXT("LibraryMenuLabel", "Motion Library"),
+		LOCTEXT("LibraryMenuLabel", "MotionForge"),
 		LOCTEXT("LibraryMenuTip",
-			"Every motion definition in the project, what state each is in, and what it produced. "
-			"Generating several at once is priced here before it is pressed."),
+			"Make motion from a prompt. Get Started walks through the setup and a first motion; the library "
+			"lists every definition, what state each is in, and what it produced."),
 		FSlateIcon(FAppStyle::GetAppStyleSetName(), "ClassIcon.AnimSequence"),
 		FUIAction(FExecuteAction::CreateLambda([]()
 		{
-			FGlobalTabmanager::Get()->TryInvokeTab(LibraryTabName);
+			SMotionHome::Open(SMotionHome::DefaultPage());
 		})));
 }
 

@@ -1,4 +1,5 @@
 #include "MotionTakeProvenance.h"
+#include "MotionForgeTypes.h"
 
 #include "MotionDef.h"
 #include "MotionForge.h"
@@ -98,7 +99,8 @@ void FMotionProvenance::Stamp(
 	bool bRunnerWasLocal,
 	int32 NativeFrameRate,
 	bool bWasNormalized,
-	bool bWasRetargeted)
+	bool bWasRetargeted,
+	const FMotionCandidate* Take)
 {
 	if (Sequence == nullptr)
 	{
@@ -150,8 +152,6 @@ void FMotionProvenance::Stamp(
 
 	if (Definition)
 	{
-		Record->Seed = Definition->Control.Seed;
-		Record->DiffusionSteps = Definition->Control.DiffusionSteps;
 		Record->DefinitionPath = Definition->GetPathName();
 
 		// Resolved, not read off the fields. A definition whose prompt lives on a timeline has a
@@ -186,6 +186,31 @@ void FMotionProvenance::Stamp(
 		Record->RequestedLengthSeconds = Beats.Beats.Num() > 0
 			? FMath::RoundToInt(Beats.TotalSeconds)
 			: Definition->Length;
+	}
+
+	// The take remembers what was actually sent, which beats anything re-read now: the seed after the
+	// variant walk, the prompt as it was when submitted, the settings by the provider's own names.
+	// Re-reading the definition recorded the base seed and whatever the prompt had become since.
+	if (Take)
+	{
+		Record->Seed = Take->Seed;
+		Record->TakeLabel = Take->GetLabel();
+		Record->SettingsSent = Take->SettingsSent;
+
+		if (!Take->PromptSent.IsEmpty())
+		{
+			Record->Prompt = Take->PromptSent;
+		}
+		if (Take->LengthSeconds > 0.f)
+		{
+			Record->RequestedLengthSeconds = FMath::RoundToInt(Take->LengthSeconds);
+		}
+
+		FString Steps;
+		if (FParse::Value(*Take->SettingsSent, TEXT("diffusion_steps="), Steps))
+		{
+			Record->DiffusionSteps = FCString::Atoi(*Steps);
+		}
 	}
 
 	Record->FrameCount = Sequence->GetNumberOfSampledKeys();
