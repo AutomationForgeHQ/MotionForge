@@ -7,7 +7,7 @@ imported onto the skeleton you chose.
 pair a character once  →  submit  →  poll  →  review  →  download  →  import
 ```
 
-<!-- forge:version -->**Version 0.4.0. Beta.**<!-- /forge:version -->
+<!-- forge:version -->**Version 0.4.1. Beta.**<!-- /forge:version -->
 
 **First verified end to end in 0.3, against a live Uthana account on 2026-08-04.** A written prompt
 produced a correct 4-second `UAnimSequence` on this project's own skeleton, checked by eye against

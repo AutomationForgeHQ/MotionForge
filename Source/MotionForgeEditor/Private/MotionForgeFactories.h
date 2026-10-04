@@ -1,4 +1,4 @@
-// Copyright Blackcode SA. All rights reserved.
+// Copyright Bojan Andrejek / MetaWorx LLC. All rights reserved.
 //
 // What makes these types appear under right-click > Automation Forge in the Content Browser.
 //

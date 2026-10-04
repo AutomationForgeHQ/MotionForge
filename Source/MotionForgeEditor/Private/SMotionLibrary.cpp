@@ -1,7 +1,8 @@
-// Copyright Blackcode SA. All rights reserved.
+// Copyright Bojan Andrejek / MetaWorx LLC. All rights reserved.
 
 #include "SMotionLibrary.h"
 
+#include "IMotionProvider.h"
 #include "MotionDef.h"
 #include "MotionForgeEditorStyle.h"
 #include "MotionForgeFactories.h"
@@ -199,6 +200,7 @@ namespace MotionLibraryUI
 		int32 Takes = 0;
 		TArray<FString> FreeOn;
 		TMap<FString, float> HourlyNow;
+		TArray<FString> RateNotes;
 
 		for (const TSharedPtr<FMotionLibraryEntry>& Entry : Entries)
 		{
@@ -216,6 +218,17 @@ namespace MotionLibraryUI
 				BilledSeconds += Resolved.Cost.BilledSeconds;
 				Currency = Resolved.Cost.Currency;
 				bOutSpends = true;
+
+				// A list price nobody entered says so here too, as it does on the definition's own cost line.
+				// Read from the provider, where the note lives, rather than widening the estimate struct.
+				if (const TSharedPtr<IMotionProvider> Provider = Subsystem->FindProvider(Resolved.ProviderId))
+				{
+					const FString Note = Provider->GetBilling().RateNote;
+					if (!Note.IsEmpty())
+					{
+						RateNotes.AddUnique(Note);
+					}
+				}
 			}
 			else
 			{
@@ -232,7 +245,8 @@ namespace MotionLibraryUI
 		TArray<FString> Parts;
 		if (Money > 0.0 || BilledSeconds > 0)
 		{
-			Parts.Add(FString::Printf(TEXT("about %s for %d s billed"), *MotionForgeStyle::Money(Money, Currency), BilledSeconds));
+			Parts.Add(FString::Printf(TEXT("about %s for %d s billed%s"), *MotionForgeStyle::Money(Money, Currency), BilledSeconds,
+				RateNotes.Num() > 0 ? *FString::Printf(TEXT(" (%s)"), *FString::Join(RateNotes, TEXT("; "))) : TEXT("")));
 		}
 		if (FreeOn.Num() > 0)
 		{

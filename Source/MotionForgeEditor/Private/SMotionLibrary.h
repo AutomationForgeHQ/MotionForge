@@ -1,4 +1,4 @@
-// Copyright Blackcode SA. All rights reserved.
+// Copyright Bojan Andrejek / MetaWorx LLC. All rights reserved.
 //
 // The library: every motion definition in the project, what state each is in, and what it produced.
 //

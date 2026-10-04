@@ -49,6 +49,13 @@ namespace MotionGeneratePrivate
 		return Forge ? Forge->FindProvider(Id) : nullptr;
 	}
 
+	/** Where a provider's rate comes from when the person did not enter it; empty when it is theirs. */
+	FString RateNote(FName Id)
+	{
+		const TSharedPtr<IMotionProvider> P = Provider(Id);
+		return P.IsValid() ? P->GetBilling().RateNote : FString();
+	}
+
 	/** A blocker the Character card is responsible for explaining and fixing. */
 	bool IsCharacterBlocker(EMotionBlocker Blocker)
 	{
@@ -1567,8 +1574,12 @@ FText SMotionGeneratePanel::GenerateLabel() const
 
 	if (Resolved.Cost.bSpendsMoney && Resolved.Cost.EstimatedCost > 0.f)
 	{
-		return FText::Format(LOCTEXT("GeneratePaidFmt", "Generate {0}  ·  {1}"), Takes,
-			FText::FromString(MFS::Money(Resolved.Cost.EstimatedCost, Resolved.Cost.Currency)));
+		// A list price nobody entered is marked here too; the tooltip and the confirmation say whose.
+		return MotionGeneratePrivate::RateNote(Resolved.ProviderId).IsEmpty()
+			? FText::Format(LOCTEXT("GeneratePaidFmt", "Generate {0}  ·  {1}"), Takes,
+				FText::FromString(MFS::Money(Resolved.Cost.EstimatedCost, Resolved.Cost.Currency)))
+			: FText::Format(LOCTEXT("GeneratePaidListFmt", "Generate {0}  ·  {1} at list price"), Takes,
+				FText::FromString(MFS::Money(Resolved.Cost.EstimatedCost, Resolved.Cost.Currency)));
 	}
 
 	return FText::Format(LOCTEXT("GenerateN2", "Generate {0}"), Takes);
@@ -1584,6 +1595,9 @@ FText SMotionGeneratePanel::GenerateTooltip() const
 	return Resolved.Readiness.Blocker == EMotionBlocker::ProviderStartable
 		? FText::Format(LOCTEXT("StartTipFmt", "{0} It is started for you first, then the takes are submitted. The first start can take several minutes."),
 			FText::FromString(Resolved.Readiness.Problem))
+		: Resolved.Cost.bSpendsMoney && !MotionGeneratePrivate::RateNote(Resolved.ProviderId).IsEmpty()
+		? FText::Format(LOCTEXT("GenerateTipListFmt", "Submit the takes. They appear on the left as they finish, and play on the character before you choose one.\n\nThe price is {0}."),
+			FText::FromString(MotionGeneratePrivate::RateNote(Resolved.ProviderId)))
 		: LOCTEXT("GenerateTip", "Submit the takes. They appear on the left as they finish, and play on the character before you choose one.");
 }
 

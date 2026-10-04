@@ -8,6 +8,17 @@ not for the commit log.
 Headings are `## <x.y.z> — <date>`. Use `Added` / `Changed` / `Fixed` / `Compatibility` /
 `Known issues`, only the ones that apply.
 
+## 0.4.1 — 2026-10-04
+
+### Fixed
+- The library's price for a selection, and the definition window's Generate button, now say when a
+  price is a provider's published rate rather than one you entered, as the cost lines already did. The
+  library's footer and its confirmation name the rate; the button reads "at list price" and its
+  tooltip says whose.
+
+### Changed
+- Copyright and licence notices now name Bojan Andrejek / MetaWorx LLC. It is still Apache 2.0, and nothing about how you may use it changed.
+
 ## 0.4.0 — 2026-09-22
 
 ### Added

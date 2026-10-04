@@ -1,4 +1,4 @@
-// Project Settings > Plugins > MotionForge.
+// Project Settings > Automation Forge > MotionForge.
 
 #pragma once
 
