@@ -3037,6 +3037,14 @@ UAnimSequence* UMotionForgeSubsystem::RetargetForPreview(
 		OutError = TEXT("The preview needs the character's Retargeter, Provider Mesh and Preview Mesh, as the import does.");
 		return nullptr;
 	}
+	// Evaluating a clip against a mesh with no skeleton is an engine assert (BoneContainer.cpp), not an
+	// error: a copied provider mesh whose skeleton was left behind took the editor down this way.
+	if (!SourceMesh->GetSkeleton() || !SourceSequence->GetSkeleton())
+	{
+		OutError = FString::Printf(TEXT("%s has no skeleton, so the take cannot be previewed on it. Point the character's Provider Mesh at a mesh whose skeleton loads."),
+			SourceMesh->GetSkeleton() ? *SourceSequence->GetName() : *SourceMesh->GetName());
+		return nullptr;
+	}
 
 	FRetargetProfile Profile;
 	Profile.FillProfileWithAssetSettings(Retargeter);

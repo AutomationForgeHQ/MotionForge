@@ -8,6 +8,11 @@ not for the commit log.
 Headings are `## <x.y.z> — <date>`. Use `Added` / `Changed` / `Fixed` / `Compatibility` /
 `Known issues`, only the ones that apply.
 
+## 0.4.2 — unreleased
+
+### Fixed
+- Previewing a take on a character whose provider mesh has no skeleton (for example a copied mesh whose skeleton was left behind) now stops with a message that names the mesh and says how to fix it, instead of crashing the editor.
+
 ## 0.4.1 — 2026-10-04
 
 ### Fixed
